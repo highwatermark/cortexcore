@@ -1,13 +1,16 @@
 """
 Unusual Whales API client for options flow data.
 
-Uses the /screener/option-contracts endpoint which provides per-contract
-flow data including volume, OI, sweep/floor volume, premium, Greeks,
-and stock price. Includes retry with exponential backoff (2 retries, 2s base).
+Uses the /option-trades/flow-alerts endpoint which provides per-alert
+flow data including volume, OI, sweep/floor flags, premium, and stock
+price.  The `newer_than` query parameter acts as a high-watermark so
+each poll only returns alerts created after the previous scan.
+Includes retry with exponential backoff (2 retries, 2s base).
 """
 from __future__ import annotations
 
 import asyncio
+import time
 
 import httpx
 
@@ -21,6 +24,11 @@ log = get_logger("uw_client")
 BASE_URL = "https://api.unusualwhales.com/api"
 MAX_RETRIES = 2
 RETRY_BASE_DELAY = 2  # seconds, exponential
+
+# Module-level high-watermark (unix seconds).
+# Persists across calls within the same process; resets on restart
+# (first call after restart does one full fetch, then incrementals).
+_last_scan_ts: float = 0.0
 
 
 class UnusualWhalesClient:
@@ -37,28 +45,46 @@ class UnusualWhalesClient:
         }
 
     async def fetch_flow(self) -> list[FlowSignal]:
-        """Fetch high-activity option contracts from the screener endpoint.
+        """Fetch new flow alerts since the last scan.
 
-        Uses /screener/option-contracts with filters for premium, volume,
-        and issue type. Returns parsed and filtered FlowSignal objects.
+        Uses /option-trades/flow-alerts with the `newer_than` parameter
+        so each poll only returns alerts created after the previous scan.
+        On the first call after startup, fetches the most recent batch
+        without a time filter.
         """
+        global _last_scan_ts
+
         params: dict = {
             "limit": self._flow_cfg.scan_limit,
-            "order_by": "volume",
-            "order": "desc",
             "min_premium": self._flow_cfg.min_premium,
         }
 
         # Filter to common stocks only
         if self._flow_cfg.issue_types:
-            params["issue_types"] = ",".join(self._flow_cfg.issue_types)
+            params["issue_types[]"] = ",".join(self._flow_cfg.issue_types)
+
+        # High-watermark: only fetch alerts newer than our last scan
+        if _last_scan_ts > 0:
+            params["newer_than"] = str(int(_last_scan_ts))
+
+        # Additional API-level filters
+        if self._flow_cfg.min_dte > 0:
+            params["min_dte"] = self._flow_cfg.min_dte
+        if self._flow_cfg.max_dte > 0:
+            params["max_dte"] = self._flow_cfg.max_dte
+        if self._flow_cfg.all_opening:
+            params["all_opening"] = "true"
+        if self._flow_cfg.min_vol_oi_ratio > 0:
+            params["min_volume_oi_ratio"] = str(self._flow_cfg.min_vol_oi_ratio)
+
+        scan_start = time.time()
 
         last_error = None
         for attempt in range(MAX_RETRIES + 1):
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
                     resp = await client.get(
-                        f"{BASE_URL}/screener/option-contracts",
+                        f"{BASE_URL}/option-trades/flow-alerts",
                         headers=self._headers,
                         params=params,
                     )
@@ -76,11 +102,23 @@ class UnusualWhalesClient:
                     raise
 
         flows = data.get("data", [])
-        log.info("uw_flow_fetched", count=len(flows))
+        if isinstance(flows, dict):
+            flows = [flows]
+
+        log.info(
+            "uw_flow_fetched",
+            count=len(flows),
+            newer_than=int(_last_scan_ts) if _last_scan_ts > 0 else "none",
+        )
+
+        # Advance the watermark so the next poll only gets newer alerts
+        _last_scan_ts = scan_start
 
         signals: list[FlowSignal] = []
         for item in flows:
-            signal = self._parse_screener_item(item)
+            if not isinstance(item, dict):
+                continue
+            signal = self._parse_flow_alert(item)
             if signal is not None:
                 signals.append(signal)
 
@@ -122,9 +160,14 @@ class UnusualWhalesClient:
             log.warning("earnings_fetch_failed", ticker=ticker, error=str(e))
             return None
 
-    def _parse_screener_item(self, item: dict) -> FlowSignal | None:
-        """Parse a screener result into a FlowSignal, or None if filtered."""
-        ticker = (item.get("ticker_symbol", "") or "").upper().strip()
+    def _parse_flow_alert(self, item: dict) -> FlowSignal | None:
+        """Parse a flow-alert into a FlowSignal, or None if filtered out.
+
+        The /option-trades/flow-alerts response uses different field names
+        than the screener endpoint (e.g. ``ticker`` not ``ticker_symbol``,
+        boolean flags instead of volume breakdowns).
+        """
+        ticker = (item.get("ticker", "") or "").upper().strip()
 
         # Filter excluded tickers
         if ticker in self._excluded or not ticker:
@@ -136,7 +179,8 @@ class UnusualWhalesClient:
             return None
 
         # Parse OCC symbol for strike/expiration/type
-        occ_sym = item.get("option_symbol", "")
+        # flow-alerts uses "option_chain" for the OCC symbol
+        occ_sym = item.get("option_chain", "") or item.get("option_symbol", "")
         parsed = parse_occ_symbol(occ_sym)
         if not parsed:
             return None
@@ -145,21 +189,23 @@ class UnusualWhalesClient:
         strike = parsed.strike
         expiration = parsed.expiration
 
-        # Parse premium
+        # Parse premium (flow-alerts returns string values)
         try:
-            premium = float(item.get("premium", 0) or 0)
+            premium = float(item.get("total_premium", 0) or item.get("premium", 0) or 0)
         except (ValueError, TypeError):
             return None
         if premium < self._flow_cfg.min_premium:
             return None
 
         # Parse volume/OI
-        volume = int(item.get("volume", 0) or 0)
-        oi = int(item.get("open_interest", 0) or 0)
+        volume = int(float(item.get("volume", 0) or 0))
+        oi = int(float(item.get("open_interest", 0) or 0))
         if oi < self._flow_cfg.min_open_interest:
             return None
 
-        vol_oi = volume / oi if oi > 0 else 0.0
+        vol_oi = float(item.get("volume_oi_ratio", 0) or 0)
+        if vol_oi == 0 and oi > 0:
+            vol_oi = volume / oi
         if vol_oi < self._flow_cfg.min_vol_oi_ratio:
             return None
 
@@ -169,25 +215,36 @@ class UnusualWhalesClient:
             return None
 
         # Underlying price and strike distance
-        underlying_price = float(item.get("stock_price", 0) or 0)
+        underlying_price = float(item.get("underlying_price", 0) or item.get("stock_price", 0) or 0)
         if underlying_price > 0 and strike > 0:
             distance = abs(strike - underlying_price) / underlying_price
             if distance > self._flow_cfg.max_strike_distance_pct:
                 return None
 
-        # Determine order type from volume breakdown
-        sweep_vol = int(item.get("sweep_volume", 0) or 0)
-        floor_vol = int(item.get("floor_volume", 0) or 0)
+        # Order type from boolean flags (flow-alerts format)
         order_parts: list[str] = []
-        if sweep_vol > 0 and sweep_vol / volume > 0.1:
+        if item.get("has_sweep", False):
             order_parts.append("sweep")
-        if floor_vol > 0 and floor_vol / volume > 0.05:
+        if item.get("has_floor", False):
             order_parts.append("floor")
-        # Check if this is a new/opening position (volume > previous OI)
-        prev_oi = int(item.get("prev_oi", 0) or 0)
-        if prev_oi > 0 and volume > prev_oi:
+        if item.get("all_opening_trades", False):
             order_parts.append("open")
         order_type = " ".join(order_parts) if order_parts else "regular"
+
+        # Directional conviction from ask/bid side premium
+        ask_prem = float(item.get("total_ask_side_prem", 0) or 0)
+        bid_prem = float(item.get("total_bid_side_prem", 0) or 0)
+        total_side_prem = ask_prem + bid_prem
+        if total_side_prem > 0:
+            directional_pct = max(ask_prem, bid_prem) / total_side_prem
+        else:
+            directional_pct = 0.0
+        directional_side = "ASK" if ask_prem >= bid_prem else "BID"
+
+        # Trade structure (directly available as booleans)
+        has_singleleg = bool(item.get("has_singleleg", False))
+        has_multileg = bool(item.get("has_multileg", False))
+        trade_count = int(float(item.get("trade_count", 0) or 0))
 
         return FlowSignal(
             ticker=ticker,
@@ -201,6 +258,14 @@ class UnusualWhalesClient:
             option_type=option_type,
             order_type=order_type,
             underlying_price=underlying_price,
-            iv_rank=0.0,  # Not directly available from screener; IV is per-contract
+            iv_rank=0.0,  # Not directly available from flow-alerts
             dte=dte,
+            ask_side_volume=ask_prem,
+            bid_side_volume=bid_prem,
+            directional_pct=round(directional_pct, 4),
+            directional_side=directional_side,
+            has_singleleg=has_singleleg,
+            has_multileg=has_multileg,
+            trade_count=trade_count,
+            next_earnings_date="",  # Fetched separately via get_next_earnings_date
         )

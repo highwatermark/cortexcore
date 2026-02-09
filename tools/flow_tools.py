@@ -6,7 +6,9 @@ flow_scanner agent can call them to fetch and score options flow data.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
+
+import pytz
 
 from config.settings import get_settings
 from core.logger import get_logger
@@ -15,20 +17,60 @@ from services.unusual_whales import UnusualWhalesClient
 
 log = get_logger("flow_tools")
 
+# Accumulate scored signals per scan cycle for Telegram digest
+_scan_scored_signals: list[tuple[dict, dict]] = []  # (signal, score_result)
+
+# High-watermark: track contracts already scored today so we don't rescore
+# the same contract (e.g. FI CALL $230 2026-03-20) on every poll cycle.
+# Keyed by "TICKER:TYPE:STRIKE:EXPIRATION", resets each trading day.
+_seen_contracts: set[str] = set()
+_seen_date: str = ""  # YYYY-MM-DD in ET, used to reset daily
+
+
+def _contract_key(sig: FlowSignal) -> str:
+    """Build a unique fingerprint for a contract."""
+    return f"{sig.ticker}:{sig.option_type}:{sig.strike}:{sig.expiration}"
+
 
 async def scan_flow() -> list[dict]:
     """Fetch recent unusual options flow and return filtered signals.
 
-    Returns a list of signal dicts ready for AI scoring.
+    Maintains a high-watermark set of already-scored contracts so the same
+    contract is not re-scored on subsequent poll cycles within the same day.
+    Returns a list of *new* signal dicts ready for AI scoring.
     """
+    global _seen_date
+
+    # Reset seen set at the start of each trading day (ET)
+    et = pytz.timezone("America/New_York")
+    today_et = datetime.now(et).strftime("%Y-%m-%d")
+    if today_et != _seen_date:
+        _seen_contracts.clear()
+        _seen_date = today_et
+        log.info("seen_contracts_reset", date=today_et)
+
+    # Clear previous cycle's scored signals
+    _scan_scored_signals.clear()
+
     client = UnusualWhalesClient()
     signals = await client.fetch_flow()
 
     results = []
+    skipped = 0
     for sig in signals[: get_settings().flow.max_analyze]:
+        key = _contract_key(sig)
+        if key in _seen_contracts:
+            skipped += 1
+            continue
+        _seen_contracts.add(key)
         results.append(sig.model_dump())
 
-    log.info("scan_flow_complete", signals_returned=len(results))
+    log.info(
+        "scan_flow_complete",
+        signals_returned=len(results),
+        skipped_already_seen=skipped,
+        seen_total=len(_seen_contracts),
+    )
     return results
 
 
@@ -76,6 +118,27 @@ def score_signal(signal: dict) -> dict:
         score += 2
         breakdown.append("opening:+2")
 
+    # Directional conviction
+    directional_pct = signal.get("directional_pct", 0)
+    directional_side = signal.get("directional_side", "")
+    if directional_pct >= 0.90:
+        score += 2
+        breakdown.append(f"direction>=90%({directional_side}):+2")
+    elif directional_pct >= 0.75:
+        score += 1
+        breakdown.append(f"direction>=75%({directional_side}):+1")
+
+    # Single leg bonus (institutional conviction)
+    if signal.get("has_singleleg") and not signal.get("has_multileg"):
+        score += 1
+        breakdown.append("singleleg:+1")
+
+    # Low trade count (institutional block)
+    trade_count = signal.get("trade_count", 0)
+    if trade_count > 0 and trade_count < 10:
+        score += 1
+        breakdown.append(f"block({trade_count}trades):+1")
+
     # --- Penalty indicators ---
     iv_rank = signal.get("iv_rank", 0)
     if iv_rank > 70:
@@ -90,6 +153,18 @@ def score_signal(signal: dict) -> dict:
         score -= 1
         breakdown.append("dte<14:-1")
 
+    # Near earnings penalty
+    next_earnings = signal.get("next_earnings_date", "")
+    if next_earnings:
+        try:
+            earnings_date = date.fromisoformat(next_earnings)
+            days_to_earnings = (earnings_date - date.today()).days
+            if 0 <= days_to_earnings < 7:
+                score -= 2
+                breakdown.append(f"earnings_in_{days_to_earnings}d:-2")
+        except (ValueError, TypeError):
+            pass
+
     # Clamp to 0-10
     score = max(0, min(10, score))
 
@@ -103,7 +178,20 @@ def score_signal(signal: dict) -> dict:
         "min_required": settings.flow.min_score,
     }
 
-    log.info("signal_scored", ticker=result["ticker"], score=score, passed=passed)
+    if directional_pct > 0:
+        log.info(
+            "signal_scored",
+            ticker=result["ticker"],
+            score=score,
+            passed=passed,
+            direction=f"{directional_pct:.0%} {directional_side} side",
+        )
+    else:
+        log.info("signal_scored", ticker=result["ticker"], score=score, passed=passed)
+
+    # Accumulate for Telegram digest
+    _scan_scored_signals.append((signal, result))
+
     return result
 
 
@@ -146,6 +234,57 @@ def save_signal(signal: dict, score_result: dict) -> str:
         session.close()
 
 
+async def send_scan_report() -> dict:
+    """Send a Telegram digest of all scored signals from this scan cycle.
+
+    Called at the end of each scan cycle to notify the user of what was
+    found, scored, and why signals passed or failed.
+    """
+    from services.telegram import TelegramNotifier
+
+    scored = list(_scan_scored_signals)
+    if not scored:
+        return {"sent": False, "reason": "no signals scored this cycle"}
+
+    notifier = TelegramNotifier()
+
+    passed = [(s, r) for s, r in scored if r["passed"]]
+    failed = [(s, r) for s, r in scored if not r["passed"]]
+
+    lines = [f"<b>Flow Scan Report</b>  ({len(scored)} scored)"]
+
+    if passed:
+        lines.append(f"\n<b>{len(passed)} PASSED</b> (score >= 7):")
+        for sig, res in passed:
+            ticker = sig.get("ticker", "?")
+            opt = sig.get("option_type", "?")
+            strike = sig.get("strike", 0)
+            dte = sig.get("dte", 0)
+            prem = sig.get("premium", 0)
+            dir_pct = sig.get("directional_pct", 0)
+            dir_side = sig.get("directional_side", "")
+            dir_str = f" {dir_pct:.0%} {dir_side}" if dir_pct > 0 else ""
+            lines.append(
+                f"  <b>{ticker}</b> {opt} ${strike:.0f}  DTE {dte}\n"
+                f"    ${prem:,.0f}  Score <b>{res['score']}/10</b>{dir_str}\n"
+                f"    <i>{res['breakdown']}</i>"
+            )
+
+    if failed:
+        lines.append(f"\n{len(failed)} rejected:")
+        for sig, res in failed:
+            ticker = sig.get("ticker", "?")
+            opt = sig.get("option_type", "?")
+            strike = sig.get("strike", 0)
+            prem = sig.get("premium", 0)
+            lines.append(f"  {ticker} {opt} ${strike:.0f}  ${prem:,.0f}  Score {res['score']}/10")
+
+    text = "\n".join(lines)
+    sent = await notifier.send(text)
+    log.info("scan_report_sent", signals=len(scored), passed=len(passed), failed=len(failed))
+    return {"sent": sent, "signals": len(scored), "passed": len(passed), "failed": len(failed)}
+
+
 # ---------------------------------------------------------------------------
 # Tool definitions for Claude agent SDK
 # ---------------------------------------------------------------------------
@@ -168,8 +307,9 @@ FLOW_TOOLS = [
         "name": "score_signal",
         "description": (
             "Score a flow signal on a 0-10 scale. Evaluates sweep/floor type, "
-            "volume/OI ratio, premium size, IV rank, and DTE. Returns score, "
-            "breakdown, and whether it passes the minimum threshold (7+)."
+            "volume/OI ratio, premium size, directional conviction (ask/bid side), "
+            "single-leg structure, trade count, IV rank, DTE, and earnings proximity. "
+            "Returns score, breakdown, and whether it passes the minimum threshold (7+)."
         ),
         "input_schema": {
             "type": "object",
@@ -198,6 +338,19 @@ FLOW_TOOLS = [
                 },
             },
             "required": ["signal", "score_result"],
+        },
+    },
+    {
+        "name": "send_scan_report",
+        "description": (
+            "Send a Telegram digest of all signals scored in this scan cycle. "
+            "Call this ONCE at the end of every scan cycle after all signals have been "
+            "scored and saved. Shows what was found, scores, and pass/fail reasons."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
         },
     },
 ]

@@ -1,14 +1,13 @@
 """
-Main monitoring loop.
+Main monitoring loop — deterministic pipeline + Claude for decisions only.
 
-Runs the orchestrator on a configurable interval with:
-- Market hours awareness (9:30-16:00 ET, uses Alpaca calendar for holidays)
-- Adaptive scan frequency
-- Position monitoring between scans
-- Order fill reconciliation
-- Daily summary at market close
-- Circuit breaker on consecutive errors
-- Graceful shutdown
+Every cycle:
+  1. Deterministic: scan flow, score, save, risk, positions, exit triggers,
+     pre-trade checks, Telegram report — ZERO Claude API calls
+  2. IF signals pass all checks → Claude called ONCE for entry decisions
+  3. IF exit triggers fire → Claude called ONCE for exit decisions
+
+Claude API calls per cycle: 0 (most cycles), 1-2 (when action needed)
 """
 from __future__ import annotations
 
@@ -30,6 +29,9 @@ from services.alpaca_broker import get_broker
 from services.telegram import TelegramNotifier
 from core.reconciler import reconcile_positions
 from tools.execution_tools import reconcile_orders
+from tools.flow_tools import scan_flow, score_signal, save_signal, send_scan_report
+from tools.position_tools import get_open_positions, check_exit_triggers
+from tools.risk_tools import calculate_portfolio_risk, pre_trade_check
 
 log = get_logger("monitor")
 
@@ -115,7 +117,6 @@ class MonitorLoop:
 
         # Check market hours (with holiday awareness)
         if not self._is_market_open():
-            # Check if we just passed market close and haven't sent summary
             if self._should_send_daily_summary():
                 await self._send_daily_summary()
             log.debug("market_closed", next_check="60s")
@@ -139,10 +140,9 @@ class MonitorLoop:
                     )
                     self._loss_breaker_notified = True
                 log.warning("trading_breaker_active", reason=breaker_state.reason)
-                # Still do position checks (monitor existing positions), but skip scanning
+                # Still monitor positions deterministically
                 await reconcile_orders()
-                log.info("cycle_position_check_only", cycle=self._cycle_count, reason="trading_breaker")
-                result = await self.orchestrator.run_position_check()
+                await self._deterministic_position_check()
                 await asyncio.sleep(self.settings.monitor.poll_interval_seconds)
                 return
             self._loss_breaker_notified = False
@@ -174,15 +174,101 @@ class MonitorLoop:
                 except Exception as e:
                     log.error("reconciliation_failed", error=str(e))
 
-            # Alternate between full scan and position check
-            if self._cycle_count % 3 == 0:
-                log.info("cycle_full_scan", cycle=self._cycle_count)
-                result = await self.orchestrator.run_scan_cycle()
-            else:
-                log.info("cycle_position_check", cycle=self._cycle_count)
-                result = await self.orchestrator.run_position_check()
+            # =========================================================
+            # DETERMINISTIC PIPELINE — zero Claude API calls
+            # =========================================================
+            log.info("cycle_start", cycle=self._cycle_count)
 
-            log.info("cycle_complete", cycle=self._cycle_count, result_preview=result[:200] if result else "")
+            # Step 1: Scan flow (UW API call)
+            signals = await scan_flow()
+            log.info("pipeline_scan", signals=len(signals))
+
+            # Step 2: Score each signal
+            scored: list[tuple[dict, dict]] = []
+            for sig in signals:
+                result = score_signal(sig)
+                save_signal(sig, result)
+                scored.append((sig, result))
+
+            # Step 3: Send Telegram scan report
+            if scored:
+                try:
+                    await send_scan_report()
+                except Exception as e:
+                    log.warning("scan_report_failed", error=str(e))
+
+            # Step 4: Portfolio risk assessment
+            risk_assessment = calculate_portfolio_risk()
+
+            # Step 5: Get open positions
+            positions = get_open_positions()
+
+            # Step 6: Check exit triggers on open positions
+            triggered: list[tuple[dict, dict]] = []
+            for pos in positions:
+                trigger_result = check_exit_triggers(pos)
+                if trigger_result.get("should_exit"):
+                    triggered.append((pos, trigger_result))
+
+            # Step 7: Filter passing signals + pre-trade checks
+            passing: list[tuple[dict, dict, dict]] = []
+            for sig, score_result in scored:
+                if not score_result.get("passed"):
+                    continue
+                ptc = pre_trade_check(sig, risk_assessment)
+                if ptc.get("approved"):
+                    passing.append((sig, score_result, ptc))
+                else:
+                    log.info("pre_trade_denied", ticker=sig.get("ticker"), reasons=ptc.get("reasons"))
+
+            # =========================================================
+            # CLAUDE DECISIONS — only when action is needed
+            # =========================================================
+            claude_calls = 0
+
+            # Entry decisions: Claude evaluates passing signals
+            if passing:
+                perf_context = self.orchestrator.get_performance_context()
+                try:
+                    entry_result = await self.orchestrator.evaluate_entries(
+                        passing_signals=passing,
+                        risk_assessment=risk_assessment,
+                        positions=positions,
+                        perf_context=perf_context,
+                    )
+                    claude_calls += 1
+                    log.info("entry_decision", result_preview=entry_result[:200] if entry_result else "")
+                except Exception as e:
+                    log.error("entry_evaluation_failed", error=str(e))
+
+            # Exit decisions: Claude evaluates triggered positions
+            if triggered:
+                try:
+                    exit_result = await self.orchestrator.evaluate_exits(
+                        triggered_positions=triggered,
+                        risk_assessment=risk_assessment,
+                    )
+                    claude_calls += 1
+                    log.info("exit_decision", result_preview=exit_result[:200] if exit_result else "")
+                except Exception as e:
+                    log.error("exit_evaluation_failed", error=str(e))
+
+            # =========================================================
+            # CYCLE SUMMARY
+            # =========================================================
+            passed_count = len(passing)
+            rejected_count = len(scored) - passed_count
+            log.info(
+                "cycle_complete",
+                cycle=self._cycle_count,
+                signals_scanned=len(signals),
+                signals_scored=len(scored),
+                signals_passed=passed_count,
+                signals_rejected=rejected_count,
+                positions_open=len(positions),
+                exit_triggers=len(triggered),
+                claude_api_calls=claude_calls,
+            )
             self._consecutive_errors = 0
 
         except Exception as e:
@@ -203,6 +289,27 @@ class MonitorLoop:
                 )
 
         await asyncio.sleep(interval)
+
+    async def _deterministic_position_check(self) -> None:
+        """Check positions without Claude (used during trading breaker)."""
+        try:
+            positions = get_open_positions()
+            risk_assessment = calculate_portfolio_risk()
+            triggered: list[tuple[dict, dict]] = []
+            for pos in positions:
+                trigger_result = check_exit_triggers(pos)
+                if trigger_result.get("should_exit"):
+                    triggered.append((pos, trigger_result))
+
+            if triggered:
+                try:
+                    await self.orchestrator.evaluate_exits(triggered, risk_assessment)
+                except Exception as e:
+                    log.error("breaker_exit_eval_failed", error=str(e))
+
+            log.info("position_check_done", positions=len(positions), triggers=len(triggered))
+        except Exception as e:
+            log.error("position_check_error", error=str(e))
 
     def _is_market_open(self) -> bool:
         """Check if we're within market trading hours (with holiday awareness)."""
@@ -239,7 +346,6 @@ class MonitorLoop:
         tz = pytz.timezone(mh.timezone)
         now = datetime.now(tz)
 
-        # Within 30 minutes after close
         market_close = now.replace(hour=mh.close_hour, minute=mh.close_minute, second=0, microsecond=0)
         minutes_past_close = (now - market_close).total_seconds() / 60
 
@@ -251,17 +357,16 @@ class MonitorLoop:
         session = get_session()
         try:
             from analytics.performance import get_performance_summary
+            from core.utils import trading_today_et
 
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = trading_today_et()
 
-            # Count trades today
             trades_today = (
                 session.query(TradeLog)
                 .filter(TradeLog.closed_at >= today)
                 .count()
             )
 
-            # Total P&L today
             trades = (
                 session.query(TradeLog)
                 .filter(TradeLog.closed_at >= today)
@@ -269,29 +374,24 @@ class MonitorLoop:
             )
             total_pnl = sum(t.pnl_dollars for t in trades)
 
-            # Open positions
             open_count = (
                 session.query(PositionRecord)
                 .filter(PositionRecord.status == PositionStatus.OPEN)
                 .count()
             )
 
-            # 30-day performance
             perf = get_performance_summary(30)
 
-            # Account equity
             try:
                 account = self._broker.get_account()
                 equity = account.get("equity", 0)
             except Exception:
                 equity = 0
 
-            # Circuit breaker state
             from core.circuit_breaker import get_trading_breaker
             breaker = get_trading_breaker()
             breaker_state = breaker.check(equity) if equity else None
 
-            # Enhanced Telegram message
             msg_parts = [
                 f"<b>Daily Summary — {today}</b>",
                 f"",

@@ -224,6 +224,18 @@ class FlowSignal(BaseModel):
     score: int = 0
     score_breakdown: str = ""
 
+    # Directional conviction fields
+    ask_side_volume: float = 0.0
+    bid_side_volume: float = 0.0
+    directional_pct: float = 0.0
+    directional_side: str = ""
+
+    # Trade structure fields
+    has_singleleg: bool = False
+    has_multileg: bool = False
+    trade_count: int = 0
+    next_earnings_date: str = ""
+
 
 class PositionSnapshot(BaseModel):
     """Current state of an open position."""

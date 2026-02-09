@@ -54,7 +54,8 @@ class TradingCircuitBreaker:
         max_pct = self._settings.monitor.max_daily_loss_pct
         session = get_session()
         try:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            from core.utils import trading_today_et
+            today = trading_today_et()
             trades = (
                 session.query(TradeLog)
                 .filter(TradeLog.closed_at >= today)
@@ -64,8 +65,8 @@ class TradingCircuitBreaker:
             loss_pct = abs(total_loss) / equity if equity > 0 else 0
 
             if loss_pct >= max_pct:
-                # Resumes next trading day (approximate: tomorrow)
-                tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d 14:30 UTC")
+                # Resumes next trading day (approximate: tomorrow 9:30 ET)
+                tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d 09:30 ET")
                 return BreakerState(
                     is_tripped=True,
                     reason=f"Daily loss {loss_pct:.1%} >= {max_pct:.0%} (${abs(total_loss):.0f})",
@@ -79,7 +80,8 @@ class TradingCircuitBreaker:
         max_pct = self._settings.monitor.max_weekly_loss_pct
         session = get_session()
         try:
-            now = datetime.now(timezone.utc)
+            from core.utils import trading_now_et
+            now = trading_now_et()
             monday = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
             trades = (
                 session.query(TradeLog)
@@ -92,7 +94,7 @@ class TradingCircuitBreaker:
             if loss_pct >= max_pct:
                 # Resumes next Monday
                 days_to_monday = 7 - now.weekday()
-                next_monday = (now + timedelta(days=days_to_monday)).strftime("%Y-%m-%d 14:30 UTC")
+                next_monday = (now + timedelta(days=days_to_monday)).strftime("%Y-%m-%d 09:30 ET")
                 return BreakerState(
                     is_tripped=True,
                     reason=f"Weekly loss {loss_pct:.1%} >= {max_pct:.0%} (${abs(total_loss):.0f})",

@@ -136,7 +136,7 @@ class HealthChecker:
             }
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
-                    "https://api.unusualwhales.com/api/screener/option-contracts",
+                    "https://api.unusualwhales.com/api/option-trades/flow-alerts",
                     headers=headers,
                     params={"limit": 1},
                 )

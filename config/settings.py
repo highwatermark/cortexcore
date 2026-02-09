@@ -64,7 +64,7 @@ class TradingLimits(BaseSettings):
     # Liquidity
     max_spread_pct: float = Field(15.0, gt=0, le=100.0)
     min_volume: int = Field(10, ge=0)
-    min_open_interest: int = Field(500, ge=0)
+    min_open_interest: int = Field(100, ge=0)
     min_bid_price: float = Field(0.05, ge=0)
 
     # Earnings
@@ -98,8 +98,8 @@ class FlowScan(BaseSettings):
     max_analyze: int = Field(10, ge=1)
 
     # Quality checks
-    min_open_interest: int = Field(500, ge=0)
-    max_strike_distance_pct: float = Field(0.10, gt=0, le=1.0)
+    min_open_interest: int = Field(100, ge=0)
+    max_strike_distance_pct: float = Field(0.20, gt=0, le=1.0)
 
     # Adaptive polling
     adaptive_scan_min_interval: int = Field(30, ge=5)
@@ -157,7 +157,7 @@ class RiskFramework(BaseSettings):
 class MonitorConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MONITOR_", extra="ignore")
 
-    poll_interval_seconds: int = Field(90, ge=5)
+    poll_interval_seconds: int = Field(120, ge=5)
     greeks_snapshot_interval_seconds: int = Field(300, ge=30)
 
     # AI triggers

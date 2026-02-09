@@ -11,12 +11,13 @@ from typing import Any, Callable
 
 from tools.execution_tools import (
     EXECUTION_TOOLS,
+    calculate_position_size,
     execute_entry,
     execute_exit,
     get_account_info,
     reconcile_orders,
 )
-from tools.flow_tools import FLOW_TOOLS, save_signal, scan_flow, score_signal
+from tools.flow_tools import FLOW_TOOLS, save_signal, scan_flow, score_signal, send_scan_report
 from tools.position_tools import POSITION_TOOLS, check_exit_triggers, get_open_positions
 from tools.risk_tools import RISK_TOOLS, calculate_portfolio_risk, pre_trade_check
 
@@ -29,6 +30,7 @@ TOOL_HANDLERS: dict[str, Callable[..., Any]] = {
     "scan_flow": scan_flow,
     "score_signal": score_signal,
     "save_signal": save_signal,
+    "send_scan_report": send_scan_report,
     # Position tools
     "get_open_positions": get_open_positions,
     "check_exit_triggers": check_exit_triggers,
@@ -36,6 +38,7 @@ TOOL_HANDLERS: dict[str, Callable[..., Any]] = {
     "calculate_portfolio_risk": calculate_portfolio_risk,
     "pre_trade_check": pre_trade_check,
     # Execution tools
+    "calculate_position_size": calculate_position_size,
     "execute_entry": execute_entry,
     "execute_exit": execute_exit,
     "get_account_info": get_account_info,

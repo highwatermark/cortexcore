@@ -7,6 +7,26 @@ import re
 from datetime import datetime, timezone
 from typing import NamedTuple
 
+import pytz
+
+# Eastern Time — the canonical timezone for US equity/options trading days.
+ET = pytz.timezone("America/New_York")
+
+
+def trading_today_et() -> str:
+    """Return today's date string (YYYY-MM-DD) in Eastern Time.
+
+    Use this for any day-boundary logic (daily counters, loss limits, calendar
+    checks).  UTC midnight != ET midnight, so using UTC causes counters to
+    reset at 7 PM ET (winter) / 8 PM ET (summer) instead of midnight.
+    """
+    return datetime.now(ET).strftime("%Y-%m-%d")
+
+
+def trading_now_et() -> datetime:
+    """Return current datetime in Eastern Time (timezone-aware)."""
+    return datetime.now(ET)
+
 
 class OccSymbol(NamedTuple):
     """Parsed OCC option symbol components."""
@@ -57,12 +77,15 @@ def parse_occ_symbol(symbol: str) -> OccSymbol | None:
 
 
 def calc_dte(expiration: str) -> int:
-    """Calculate days to expiration from a YYYY-MM-DD date string."""
+    """Calculate days to expiration from a YYYY-MM-DD date string.
+
+    Uses ET so that DTE doesn't flip a day early near UTC midnight.
+    """
     if not expiration:
         return 0
     try:
-        exp_date = datetime.strptime(expiration, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        return max(0, (exp_date - now).days)
+        exp_date = datetime.strptime(expiration, "%Y-%m-%d").date()
+        today = datetime.now(ET).date()
+        return max(0, (exp_date - today).days)
     except ValueError:
         return 0

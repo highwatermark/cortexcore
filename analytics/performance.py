@@ -21,7 +21,8 @@ def _get_trades(days: int = 30) -> list[TradeLog]:
     """Fetch closed trades within the lookback window."""
     session = get_session()
     try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        from core.utils import trading_now_et
+        cutoff = (trading_now_et() - timedelta(days=days)).strftime("%Y-%m-%d")
         return (
             session.query(TradeLog)
             .filter(TradeLog.closed_at >= cutoff)

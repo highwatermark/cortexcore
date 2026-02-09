@@ -1,13 +1,15 @@
 """
-Multi-agent orchestrator using the Anthropic API.
+Orchestrator — deterministic pipeline + Claude for trade decisions only.
 
-Architecture:
-  - Lead agent (orchestrator) coordinates 4 subagents
-  - Each subagent has role-specific tools and system prompts
-  - The orchestrator runs an agentic loop: send message -> handle tool calls -> repeat
+Flow (per cycle):
+  1. Monitor loop calls deterministic functions directly (scan, score, save,
+     risk, positions, exit triggers, pre-trade checks) — zero Claude API calls.
+  2. Only when signals score 7+ AND pass pre-trade checks, Claude is called
+     ONCE to evaluate entries (thesis, conviction, sizing, execute or skip).
+  3. Only when exit triggers fire on open positions, Claude is called ONCE
+     to confirm exits.
 
-Uses AsyncAnthropic so LLM calls don't block the event loop.
-Includes retry with exponential backoff for transient API errors.
+This keeps Claude API usage to 0-2 calls per cycle instead of 4-10+.
 """
 from __future__ import annotations
 
@@ -17,16 +19,9 @@ from typing import Any
 
 import anthropic
 
-from agents.definitions import (
-    executor_prompt,
-    flow_scanner_prompt,
-    orchestrator_prompt,
-    position_manager_prompt,
-    risk_manager_prompt,
-)
 from config.settings import get_settings
 from core.logger import get_logger
-from tools import TOOLS_BY_ROLE, dispatch_tool
+from tools import dispatch_tool
 
 log = get_logger("orchestrator")
 
@@ -34,9 +29,136 @@ log = get_logger("orchestrator")
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # seconds
 
+# ---------------------------------------------------------------------------
+# Tools Claude gets for decisions — execution only, no scanning/scoring
+# ---------------------------------------------------------------------------
+
+DECISION_TOOLS = [
+    {
+        "name": "calculate_position_size",
+        "description": (
+            "Calculate the maximum number of contracts for a new position based on "
+            "current equity, existing exposure, and risk limits. Returns max_contracts "
+            "and the limiting factor. Call this BEFORE execute_entry."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "option_price": {
+                    "type": "number",
+                    "description": "The option premium per contract (e.g., 2.50 for $250/contract)",
+                },
+            },
+            "required": ["option_price"],
+        },
+    },
+    {
+        "name": "execute_entry",
+        "description": (
+            "Execute a BUY limit order for an options contract. Runs the safety gate, "
+            "submits to Alpaca, polls for fill, creates position record, sends Telegram alert. "
+            "Only call this when you have decided to trade."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "signal_id": {"type": "string", "description": "The signal ID"},
+                "ticker": {"type": "string", "description": "Stock ticker"},
+                "option_symbol": {"type": "string", "description": "Full OCC option symbol"},
+                "side": {"type": "string", "enum": ["BUY", "SELL"], "description": "Order side"},
+                "quantity": {"type": "integer", "description": "Number of contracts"},
+                "limit_price": {"type": "number", "description": "Limit price per contract"},
+                "thesis": {"type": "string", "description": "1-2 sentence entry thesis"},
+                "conviction": {"type": "integer", "description": "Conviction score 0-100"},
+                "iv_rank": {"type": "number", "description": "IV rank (0-100)"},
+                "dte": {"type": "integer", "description": "Days to expiration"},
+            },
+            "required": ["signal_id", "ticker", "option_symbol", "side", "quantity", "limit_price"],
+        },
+    },
+    {
+        "name": "execute_exit",
+        "description": (
+            "Exit an open position. Submits sell order, polls for fill, records P&L, "
+            "sends Telegram alert."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "position_id": {"type": "string", "description": "Position ID to exit"},
+                "reason": {"type": "string", "description": "Exit reason"},
+                "use_market": {"type": "boolean", "description": "Market order (emergencies only)"},
+            },
+            "required": ["position_id"],
+        },
+    },
+    {
+        "name": "get_account_info",
+        "description": "Get broker account: equity, buying power, cash, portfolio value.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+]
+
+# ---------------------------------------------------------------------------
+# System prompts — focused on decision-making, not orchestration
+# ---------------------------------------------------------------------------
+
+ENTRY_DECISION_SYSTEM = """\
+You are an options trader evaluating whether to enter trades based on unusual options flow.
+
+You receive pre-computed data from a deterministic pipeline:
+- High-scoring flow signals (already scored 7+ out of 10 and passed pre-trade checks)
+- Current portfolio risk assessment
+- Open positions with P&L
+- Account equity
+
+Your job is to decide for each signal: TRADE or SKIP.
+
+For TRADE signals:
+1. Call calculate_position_size with the estimated option price to get max contracts
+2. Call execute_entry with your conviction (0-100), a 1-2 sentence thesis, and quantity
+3. Be selective — skip marginal setups, there will always be another signal
+
+RISK RULES (non-negotiable):
+- Never enter if risk_level is CRITICAL
+- If risk_level is ELEVATED, only exceptional setups (conviction >= 90)
+- Consider correlation with existing positions (don't double up on same sector)
+
+Keep your reasoning brief. Focus on the decision.
+"""
+
+EXIT_DECISION_SYSTEM = """\
+You are an options trader evaluating whether to exit positions that have triggered exit conditions.
+
+You receive pre-computed data:
+- Positions with triggered exit conditions, urgency levels, and trigger details
+- Current portfolio risk assessment
+
+For each position, decide: EXIT or HOLD.
+
+HARD RULES (always exit, no discretion):
+- DTE <= 5 (mandatory expiration risk)
+- Stop loss hit (P&L <= -35%)
+
+DISCRETIONARY (you decide):
+- Profit target hit — consider momentum, is there more to gain?
+- Gamma risk — evaluate if the remaining edge justifies the risk
+- Theta acceleration — is time decay eating the position?
+- Conviction drop — has the thesis been invalidated?
+
+For EXIT: call execute_exit with position_id and reason.
+For HOLD: explain briefly why you're holding despite the trigger.
+
+Keep reasoning brief.
+"""
+
 
 class AgentRunner:
-    """Runs a single agent (lead or subagent) through an agentic tool-use loop."""
+    """Runs a Claude agent through an agentic tool-use loop."""
 
     def __init__(
         self,
@@ -45,14 +167,14 @@ class AgentRunner:
         tools: list[dict],
         model: str | None = None,
         max_tokens: int | None = None,
-        max_turns: int = 15,
+        max_turns: int = 8,
     ) -> None:
         settings = get_settings()
         self.role = role
         self.system_prompt = system_prompt
         self.tools = tools
-        self.model = model or settings.agent_model.subagent_model
-        self.max_tokens = max_tokens or settings.agent_model.subagent_max_tokens
+        self.model = model or settings.agent_model.orchestrator_model
+        self.max_tokens = max_tokens or settings.agent_model.orchestrator_max_tokens
         self.max_turns = max_turns
         self._client = anthropic.AsyncAnthropic(api_key=settings.api.anthropic_api_key)
 
@@ -74,18 +196,13 @@ class AgentRunner:
                 log.warning("api_retry", role=self.role, attempt=attempt + 1, delay=delay, error=str(e))
                 await asyncio.sleep(delay)
             except anthropic.APIStatusError as e:
-                # Non-retryable API errors (auth, bad request, etc.)
                 log.error("api_error_non_retryable", role=self.role, status=e.status_code, error=str(e))
                 raise
 
         raise last_error  # type: ignore[misc]
 
     async def run(self, user_message: str) -> str:
-        """Run the agent with a user message and return the final text response.
-
-        Loops through tool_use blocks until the model produces a text-only response
-        or hits max_turns.
-        """
+        """Run the agent and return the final text response."""
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": user_message},
         ]
@@ -94,10 +211,8 @@ class AgentRunner:
 
         for turn in range(self.max_turns):
             log.debug("agent_turn", role=self.role, turn=turn + 1)
-
             response = await self._call_api(messages)
 
-            # Collect text and tool_use blocks
             text_parts = []
             tool_calls: list[dict] = []
 
@@ -111,16 +226,13 @@ class AgentRunner:
                         "input": block.input,
                     })
 
-            # If no tool calls, we're done
             if not tool_calls:
                 final_text = "\n".join(text_parts)
                 log.info("agent_done", role=self.role, turns=turn + 1, response_len=len(final_text))
                 return final_text
 
-            # Add assistant message with all content blocks
             messages.append({"role": "assistant", "content": response.content})
 
-            # Execute tools and collect results
             tool_results = []
             for tc in tool_calls:
                 log.info("tool_call", role=self.role, tool=tc["name"], args_keys=list(tc["input"].keys()))
@@ -134,53 +246,148 @@ class AgentRunner:
             messages.append({"role": "user", "content": tool_results})
 
         log.warning("agent_max_turns", role=self.role, max_turns=self.max_turns)
-        return "\n".join(text_parts) if text_parts else "[Agent reached max turns without final response]"
+        return "\n".join(text_parts) if text_parts else "[Agent reached max turns]"
 
 
 class Orchestrator:
-    """The lead orchestrator that coordinates subagents for a trading cycle."""
+    """Deterministic pipeline + Claude for trade decisions only.
+
+    The monitor loop calls deterministic methods directly. Claude is invoked
+    only via evaluate_entries() and evaluate_exits().
+    """
 
     def __init__(self) -> None:
-        settings = get_settings()
+        self._settings = get_settings()
 
-        # Lead agent has access to all tools
-        self.lead = AgentRunner(
-            role="orchestrator",
-            system_prompt=orchestrator_prompt(),
-            tools=TOOLS_BY_ROLE["orchestrator"],
-            model=settings.agent_model.orchestrator_model,
-            max_tokens=settings.agent_model.orchestrator_max_tokens,
-            max_turns=20,
+    def _make_agent(self, system: str) -> AgentRunner:
+        """Create a short-lived agent for a single decision."""
+        return AgentRunner(
+            role="trade_decision",
+            system_prompt=system,
+            tools=DECISION_TOOLS,
+            model=self._settings.agent_model.orchestrator_model,
+            max_tokens=self._settings.agent_model.orchestrator_max_tokens,
+            max_turns=8,
         )
 
-        # Subagents — used for delegated tasks
-        self.subagents = {
-            "flow_scanner": AgentRunner(
-                role="flow_scanner",
-                system_prompt=flow_scanner_prompt(),
-                tools=TOOLS_BY_ROLE["flow_scanner"],
-            ),
-            "position_manager": AgentRunner(
-                role="position_manager",
-                system_prompt=position_manager_prompt(),
-                tools=TOOLS_BY_ROLE["position_manager"],
-            ),
-            "risk_manager": AgentRunner(
-                role="risk_manager",
-                system_prompt=risk_manager_prompt(),
-                tools=TOOLS_BY_ROLE["risk_manager"],
-            ),
-            "executor": AgentRunner(
-                role="executor",
-                system_prompt=executor_prompt(),
-                tools=TOOLS_BY_ROLE["executor"],
-            ),
-        }
+    async def evaluate_entries(
+        self,
+        passing_signals: list[tuple[dict, dict, dict]],
+        risk_assessment: dict,
+        positions: list[dict],
+        perf_context: str,
+    ) -> str:
+        """Call Claude ONCE to decide on entries for signals that passed all checks.
 
-    def _get_performance_context(self) -> str:
-        """Build performance context string for agent prompts."""
+        Args:
+            passing_signals: list of (signal, score_result, pre_trade_result) tuples
+            risk_assessment: portfolio risk from calculate_portfolio_risk()
+            positions: open positions from get_open_positions()
+            perf_context: performance context string
+
+        Returns:
+            Claude's response text (reasoning + any tool calls it made).
+        """
+        signals_text = []
+        for sig, score, ptc in passing_signals:
+            signals_text.append(
+                f"  {sig['ticker']} {sig.get('option_type', '?')} ${sig.get('strike', 0):.0f} "
+                f"exp {sig.get('expiration', '?')} DTE={sig.get('dte', 0)}\n"
+                f"    Premium: ${sig.get('premium', 0):,.0f} | Vol/OI: {sig.get('vol_oi_ratio', 0)} | "
+                f"Order type: {sig.get('order_type', '?')}\n"
+                f"    Score: {score['score']}/10 — {score['breakdown']}\n"
+                f"    Direction: {sig.get('directional_pct', 0):.0%} {sig.get('directional_side', '')} side\n"
+                f"    Underlying: ${sig.get('underlying_price', 0):,.2f}\n"
+                f"    Signal ID: {sig.get('signal_id', '')}\n"
+                f"    Pre-trade: {'APPROVED' if ptc.get('approved') else 'DENIED'} "
+                f"{', '.join(ptc.get('reasons', [])) or '(no issues)'}"
+            )
+
+        risk_text = (
+            f"Risk score: {risk_assessment.get('risk_score', 0)}/100 "
+            f"({risk_assessment.get('risk_level', 'UNKNOWN')})\n"
+            f"  Risk capacity: {risk_assessment.get('risk_capacity_pct', 0):.0%}\n"
+            f"  Open positions: {risk_assessment.get('position_count', 0)}/{self._settings.trading.max_positions}\n"
+            f"  Delta exposure: {risk_assessment.get('delta_exposure', 0)}\n"
+            f"  Theta daily: {risk_assessment.get('theta_daily_pct', 0):.3%}\n"
+            f"  Warnings: {', '.join(risk_assessment.get('warnings', [])) or 'none'}"
+        )
+
+        if positions:
+            pos_lines = []
+            for p in positions:
+                pos_lines.append(
+                    f"  {p['ticker']} {p.get('action', '?')} ${p.get('strike', 0):.0f} "
+                    f"exp {p.get('expiration', '?')} DTE={p.get('dte_remaining', 0)}\n"
+                    f"    P&L: {p.get('pnl_pct', 0):+.1f}% (${p.get('pnl_dollars', 0):+.2f}) "
+                    f"Qty: {p.get('quantity', 0)} @ ${p.get('entry_price', 0):.2f}"
+                )
+            positions_text = "\n".join(pos_lines)
+        else:
+            positions_text = "  (none)"
+
+        prompt = (
+            f"SIGNALS THAT PASSED ALL CHECKS (score 7+ and pre-trade approved):\n"
+            f"{''.join(s + chr(10) for s in signals_text)}\n"
+            f"PORTFOLIO RISK:\n{risk_text}\n\n"
+            f"OPEN POSITIONS:\n{positions_text}\n"
+            f"{perf_context}\n"
+            f"For each signal, decide TRADE or SKIP. For trades, call "
+            f"calculate_position_size first, then execute_entry with your thesis and conviction."
+        )
+
+        agent = self._make_agent(ENTRY_DECISION_SYSTEM)
+        log.info("claude_entry_evaluation", signals=len(passing_signals))
+        result = await agent.run(prompt)
+        log.info("claude_entry_done", response_len=len(result))
+        return result
+
+    async def evaluate_exits(
+        self,
+        triggered_positions: list[tuple[dict, dict]],
+        risk_assessment: dict,
+    ) -> str:
+        """Call Claude ONCE to decide on exits for positions with triggers.
+
+        Args:
+            triggered_positions: list of (position_dict, trigger_result) tuples
+            risk_assessment: portfolio risk from calculate_portfolio_risk()
+
+        Returns:
+            Claude's response text.
+        """
+        triggers_text = []
+        for pos, triggers in triggered_positions:
+            triggers_text.append(
+                f"  {pos['ticker']} {pos.get('action', '?')} ${pos.get('strike', 0):.0f} "
+                f"exp {pos.get('expiration', '?')} DTE={pos.get('dte_remaining', 0)}\n"
+                f"    P&L: {pos.get('pnl_pct', 0):+.1f}% (${pos.get('pnl_dollars', 0):+.2f})\n"
+                f"    Entry: ${pos.get('entry_price', 0):.2f} → Current: ${pos.get('current_price', 0):.2f}\n"
+                f"    Triggers: {', '.join(triggers.get('triggers', []))}\n"
+                f"    Urgency: {triggers.get('urgency', 'low')}\n"
+                f"    Thesis: {pos.get('entry_thesis', 'n/a')}\n"
+                f"    Position ID: {pos['position_id']}"
+            )
+
+        prompt = (
+            f"POSITIONS WITH EXIT TRIGGERS:\n"
+            f"{''.join(t + chr(10) for t in triggers_text)}\n"
+            f"Portfolio risk: {risk_assessment.get('risk_score', 0)}/100 "
+            f"({risk_assessment.get('risk_level', 'UNKNOWN')})\n\n"
+            f"For each position, decide EXIT or HOLD. "
+            f"For critical urgency (DTE mandatory, stop loss), always EXIT."
+        )
+
+        agent = self._make_agent(EXIT_DECISION_SYSTEM)
+        log.info("claude_exit_evaluation", positions=len(triggered_positions))
+        result = await agent.run(prompt)
+        log.info("claude_exit_done", response_len=len(result))
+        return result
+
+    def get_performance_context(self) -> str:
+        """Build performance context string for Claude prompts."""
         try:
-            from analytics.performance import get_win_rate, get_max_drawdown, get_performance_summary
+            from analytics.performance import get_win_rate, get_max_drawdown
             from data.models import (
                 IntentStatus,
                 OrderIntent,
@@ -189,11 +396,11 @@ class Orchestrator:
                 TradeLog,
                 get_session,
             )
-            from datetime import datetime, timezone
+            from core.utils import trading_today_et
 
             session = get_session()
             try:
-                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                today = trading_today_et()
                 trades_today = (
                     session.query(OrderIntent)
                     .filter(
@@ -208,7 +415,6 @@ class Orchestrator:
                     .filter(PositionRecord.status == PositionStatus.OPEN)
                     .count()
                 )
-                # Recent consecutive losses
                 recent = (
                     session.query(TradeLog)
                     .order_by(TradeLog.closed_at.desc())
@@ -227,9 +433,8 @@ class Orchestrator:
             win_rate = get_win_rate(30)
             drawdown = get_max_drawdown(30)
 
-            settings = get_settings()
-            max_exec = settings.trading.max_executions_per_day
-            max_pos = settings.trading.max_positions
+            max_exec = self._settings.trading.max_executions_per_day
+            max_pos = self._settings.trading.max_positions
 
             return (
                 f"\nPERFORMANCE CONTEXT:\n"
@@ -242,53 +447,3 @@ class Orchestrator:
         except Exception as e:
             log.warning("performance_context_error", error=str(e))
             return ""
-
-    async def run_scan_cycle(self) -> str:
-        """Run a complete scan cycle: check flow, evaluate positions, manage risk.
-
-        This is called by the monitor loop on each tick.
-        Returns a summary of actions taken.
-        """
-        perf_context = self._get_performance_context()
-        prompt = (
-            "Run a complete trading cycle:\n"
-            "1. Scan for new unusual options flow signals\n"
-            "2. Score any signals found and save them\n"
-            "3. Check the current portfolio risk level\n"
-            "4. For any signals scoring 7+, run pre-trade checks\n"
-            "5. Check all open positions for exit triggers\n"
-            "6. Execute any approved entries or exits\n"
-            "7. Summarize what happened this cycle\n\n"
-            "Be concise. Only execute trades that pass all checks."
-            f"{perf_context}"
-        )
-
-        log.info("scan_cycle_start")
-        result = await self.lead.run(prompt)
-        log.info("scan_cycle_complete", result_len=len(result))
-        return result
-
-    async def run_position_check(self) -> str:
-        """Focused position monitoring cycle."""
-        prompt = (
-            "Focus on position management:\n"
-            "1. Get all open positions with current prices\n"
-            "2. Check each position for exit triggers\n"
-            "3. Execute any needed exits\n"
-            "4. Summarize position status\n"
-        )
-
-        log.info("position_check_start")
-        result = await self.lead.run(prompt)
-        log.info("position_check_complete")
-        return result
-
-    async def run_risk_check(self) -> str:
-        """Focused risk assessment."""
-        prompt = (
-            "Calculate the current portfolio risk score and provide a brief "
-            "risk assessment. Include any warnings or concerns."
-        )
-
-        result = await self.lead.run(prompt)
-        return result
