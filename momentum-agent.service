@@ -1,0 +1,29 @@
+[Unit]
+Description=Momentum Agent v2 - Options Flow Trading System
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/momentum-agent-v2
+ExecStart=/home/ubuntu/momentum-agent-v2/.venv/bin/python -m scripts.run
+Restart=on-failure
+RestartSec=30
+
+# Environment
+EnvironmentFile=/home/ubuntu/momentum-agent-v2/.env
+
+# Logging - stdout/stderr go to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=momentum-agent
+
+# Graceful shutdown (SIGTERM -> stop() handler)
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

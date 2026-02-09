@@ -1,0 +1,38 @@
+# Secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Database
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/backups/
+
+# Logs
+logs/
+
+# Kill switch
+KILLSWITCH
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
