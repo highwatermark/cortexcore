@@ -111,10 +111,18 @@ class UnusualWhalesClient:
             newer_than=int(_last_scan_ts) if _last_scan_ts > 0 else "none",
         )
 
-        # Advance the watermark only if we got results; otherwise hold back
-        # so the next poll can catch alerts that arrive in the gap.
+        # Advance the watermark to the latest alert timestamp so the next
+        # poll picks up only genuinely new alerts.  start_time is millis.
         if flows:
-            _last_scan_ts = scan_start
+            max_alert_ts = max(
+                (int(item.get("start_time", 0)) // 1000 for item in flows if item.get("start_time")),
+                default=0,
+            )
+            if max_alert_ts > 0:
+                _last_scan_ts = max_alert_ts
+            else:
+                # Fallback: no start_time in response — hold watermark steady
+                log.warning("uw_no_start_time", sample_keys=list(flows[0].keys())[:10])
         elif _last_scan_ts > 0:
             # Cap staleness: don't look back more than 5 minutes
             _last_scan_ts = max(_last_scan_ts, scan_start - 300)
