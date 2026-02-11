@@ -215,7 +215,7 @@ class MonitorLoop:
             for sig, score_result in scored:
                 if not score_result.get("passed"):
                     continue
-                ptc = pre_trade_check(sig, risk_assessment)
+                ptc = pre_trade_check({**sig, "score": score_result.get("score", 0)}, risk_assessment)
                 if ptc.get("approved"):
                     passing.append((sig, score_result, ptc))
                 else:
