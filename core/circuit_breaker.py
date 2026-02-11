@@ -54,8 +54,9 @@ class TradingCircuitBreaker:
         max_pct = self._settings.monitor.max_daily_loss_pct
         session = get_session()
         try:
-            from core.utils import trading_today_et
+            from core.utils import trading_today_et, trading_now_et
             today = trading_today_et()
+            now = trading_now_et()
             trades = (
                 session.query(TradeLog)
                 .filter(TradeLog.closed_at >= today)

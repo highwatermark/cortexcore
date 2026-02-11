@@ -6,7 +6,8 @@ Wraps alpaca-py OptionHistoricalDataClient for snapshot queries.
 from __future__ import annotations
 
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import OptionSnapshotRequest
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import OptionSnapshotRequest, StockSnapshotRequest
 
 from config.settings import get_settings
 from core.logger import get_logger
@@ -28,11 +29,20 @@ class AlpacaOptionsData:
     """Synchronous Alpaca options data client for snapshots."""
 
     def __init__(self) -> None:
-        settings = get_settings()
+        self._settings = get_settings()
         self._client = OptionHistoricalDataClient(
-            api_key=settings.api.alpaca_api_key,
-            secret_key=settings.api.alpaca_secret_key,
+            api_key=self._settings.api.alpaca_api_key,
+            secret_key=self._settings.api.alpaca_secret_key,
         )
+        self._stock_client: StockHistoricalDataClient | None = None
+
+    def _get_stock_client(self) -> StockHistoricalDataClient:
+        if self._stock_client is None:
+            self._stock_client = StockHistoricalDataClient(
+                api_key=self._settings.api.alpaca_api_key,
+                secret_key=self._settings.api.alpaca_secret_key,
+            )
+        return self._stock_client
 
     def get_snapshots(self, symbols: list[str]) -> dict[str, dict]:
         """Fetch option snapshots for a list of OCC symbols.
@@ -81,3 +91,56 @@ class AlpacaOptionsData:
 
         log.info("snapshots_fetched", requested=len(symbols), returned=len(results))
         return results
+
+    def get_market_context(self) -> dict:
+        """Fetch VIX (via VIXY) and SPY market context for Claude decisions.
+
+        Returns {
+            "vix_level": float,      # VIXY price as VIX proxy
+            "vix_change_pct": float,  # daily change %
+            "spy_price": float,
+            "spy_change_pct": float,  # daily change %
+            "regime": str,            # LOW_VOL / NORMAL / ELEVATED / HIGH_VOL
+        }
+        """
+        client = self._get_stock_client()
+        try:
+            request = StockSnapshotRequest(symbol_or_symbols=["VIXY", "SPY"])
+            snapshots = client.get_stock_snapshot(request)
+        except Exception as e:
+            log.error("market_context_fetch_failed", error=str(e))
+            return {}
+
+        result: dict = {}
+        for symbol in ("VIXY", "SPY"):
+            snap = snapshots.get(symbol)
+            if snap is None:
+                continue
+            price = snap.daily_bar.close if snap.daily_bar else None
+            prev_close = snap.previous_daily_bar.close if snap.previous_daily_bar else None
+            change_pct = 0.0
+            if price and prev_close and prev_close > 0:
+                change_pct = round((price - prev_close) / prev_close * 100, 2)
+            if symbol == "VIXY":
+                result["vix_level"] = price
+                result["vix_change_pct"] = change_pct
+            else:
+                result["spy_price"] = price
+                result["spy_change_pct"] = change_pct
+
+        if "vix_level" in result:
+            result["regime"] = self._classify_regime(result["vix_level"])
+
+        log.info("market_context_fetched", **{k: v for k, v in result.items() if v is not None})
+        return result
+
+    @staticmethod
+    def _classify_regime(vixy_price: float) -> str:
+        if vixy_price < 14:
+            return "LOW_VOL"
+        elif vixy_price < 20:
+            return "NORMAL"
+        elif vixy_price < 30:
+            return "ELEVATED"
+        else:
+            return "HIGH_VOL"

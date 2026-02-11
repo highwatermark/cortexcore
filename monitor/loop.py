@@ -236,6 +236,16 @@ class MonitorLoop:
             # =========================================================
             claude_calls = 0
 
+            # Fetch market context for Claude decisions
+            market_context = None
+            if passing or triggered:
+                try:
+                    from services.alpaca_options_data import get_options_data_client
+                    market_context = get_options_data_client().get_market_context()
+                    log.info("market_context", **market_context)
+                except Exception as e:
+                    log.warning("market_context_failed", error=str(e))
+
             # Entry decisions: Claude evaluates passing signals
             if passing:
                 perf_context = self.orchestrator.get_performance_context()
@@ -245,6 +255,7 @@ class MonitorLoop:
                         risk_assessment=risk_assessment,
                         positions=positions,
                         perf_context=perf_context,
+                        market_context=market_context,
                     )
                     claude_calls += 1
                     log.info("entry_decision", result_preview=entry_result[:200] if entry_result else "")
@@ -257,6 +268,7 @@ class MonitorLoop:
                     exit_result = await self.orchestrator.evaluate_exits(
                         triggered_positions=triggered,
                         risk_assessment=risk_assessment,
+                        market_context=market_context,
                     )
                     claude_calls += 1
                     log.info("exit_decision", result_preview=exit_result[:200] if exit_result else "")
@@ -313,7 +325,7 @@ class MonitorLoop:
 
             if triggered:
                 try:
-                    await self.orchestrator.evaluate_exits(triggered, risk_assessment)
+                    await self.orchestrator.evaluate_exits(triggered, risk_assessment, market_context=None)
                 except Exception as e:
                     log.error("breaker_exit_eval_failed", error=str(e))
 

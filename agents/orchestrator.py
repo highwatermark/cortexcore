@@ -128,6 +128,12 @@ RISK RULES (non-negotiable):
 - If risk_level is ELEVATED, only exceptional setups (conviction >= 90)
 - Consider correlation with existing positions (don't double up on same sector)
 
+MARKET REGIME (from VIX level):
+- LOW_VOL: Standard entries. Flow signals likely directional conviction.
+- NORMAL: Standard entries. No adjustment needed.
+- ELEVATED: Tighten sizing by 50%. Flow may be hedging, not conviction. Require higher conviction (80+).
+- HIGH_VOL: Extreme caution. Most flow is likely hedging. Only enter with conviction 95+ and clear directional thesis.
+
 Keep your reasoning brief. Focus on the decision.
 """
 
@@ -149,6 +155,10 @@ DISCRETIONARY (you decide):
 - Gamma risk — evaluate if the remaining edge justifies the risk
 - Theta acceleration — is time decay eating the position?
 - Conviction drop — has the thesis been invalidated?
+
+MARKET REGIME considerations:
+- In ELEVATED/HIGH_VOL: lower profit targets (take profits sooner), tighten stops.
+- In LOW_VOL: can afford to let winners run longer.
 
 For EXIT: call execute_exit with position_id and reason.
 For HOLD: explain briefly why you're holding despite the trigger.
@@ -276,6 +286,7 @@ class Orchestrator:
         risk_assessment: dict,
         positions: list[dict],
         perf_context: str,
+        market_context: dict | None = None,
     ) -> str:
         """Call Claude ONCE to decide on entries for signals that passed all checks.
 
@@ -284,6 +295,7 @@ class Orchestrator:
             risk_assessment: portfolio risk from calculate_portfolio_risk()
             positions: open positions from get_open_positions()
             perf_context: performance context string
+            market_context: VIX/SPY context from get_market_context()
 
         Returns:
             Claude's response text (reasoning + any tool calls it made).
@@ -326,12 +338,15 @@ class Orchestrator:
         else:
             positions_text = "  (none)"
 
+        market_text = self._format_market_context(market_context)
+
         prompt = (
             f"SIGNALS THAT PASSED ALL CHECKS (score 7+ and pre-trade approved):\n"
             f"{''.join(s + chr(10) for s in signals_text)}\n"
             f"PORTFOLIO RISK:\n{risk_text}\n\n"
             f"OPEN POSITIONS:\n{positions_text}\n"
             f"{perf_context}\n"
+            f"{market_text}"
             f"For each signal, decide TRADE or SKIP. For trades, call "
             f"calculate_position_size first, then execute_entry with your thesis and conviction."
         )
@@ -346,12 +361,14 @@ class Orchestrator:
         self,
         triggered_positions: list[tuple[dict, dict]],
         risk_assessment: dict,
+        market_context: dict | None = None,
     ) -> str:
         """Call Claude ONCE to decide on exits for positions with triggers.
 
         Args:
             triggered_positions: list of (position_dict, trigger_result) tuples
             risk_assessment: portfolio risk from calculate_portfolio_risk()
+            market_context: VIX/SPY context from get_market_context()
 
         Returns:
             Claude's response text.
@@ -369,11 +386,14 @@ class Orchestrator:
                 f"    Position ID: {pos['position_id']}"
             )
 
+        market_text = self._format_market_context(market_context)
+
         prompt = (
             f"POSITIONS WITH EXIT TRIGGERS:\n"
             f"{''.join(t + chr(10) for t in triggers_text)}\n"
             f"Portfolio risk: {risk_assessment.get('risk_score', 0)}/100 "
             f"({risk_assessment.get('risk_level', 'UNKNOWN')})\n\n"
+            f"{market_text}"
             f"For each position, decide EXIT or HOLD. "
             f"For critical urgency (DTE mandatory, stop loss), always EXIT."
         )
@@ -383,6 +403,29 @@ class Orchestrator:
         result = await agent.run(prompt)
         log.info("claude_exit_done", response_len=len(result))
         return result
+
+    @staticmethod
+    def _format_market_context(market_context: dict | None) -> str:
+        if not market_context:
+            return ""
+        regime = market_context.get("regime", "UNKNOWN")
+        regime_notes = {
+            "LOW_VOL": "Calm conditions — standard entries OK, let winners run.",
+            "NORMAL": "Typical conditions — no adjustment needed.",
+            "ELEVATED": "Heightened volatility — tighten sizing, flow may be hedging.",
+            "HIGH_VOL": "Extreme volatility — most flow is hedging, extreme caution.",
+        }
+        vix = market_context.get("vix_level")
+        vix_chg = market_context.get("vix_change_pct", 0)
+        spy = market_context.get("spy_price")
+        spy_chg = market_context.get("spy_change_pct", 0)
+        lines = ["MARKET CONTEXT:"]
+        if vix is not None:
+            lines.append(f"  VIX (VIXY): {vix:.2f} ({vix_chg:+.1f}%) — {regime} regime")
+        if spy is not None:
+            lines.append(f"  SPY: ${spy:.2f} ({spy_chg:+.1f}%)")
+        lines.append(f"  Regime note: {regime_notes.get(regime, 'Unknown regime')}")
+        return "\n".join(lines) + "\n\n"
 
     def get_performance_context(self) -> str:
         """Build performance context string for Claude prompts."""
