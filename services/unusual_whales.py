@@ -3,14 +3,20 @@ Unusual Whales API client for options flow data.
 
 Uses the /option-trades/flow-alerts endpoint which provides per-alert
 flow data including volume, OI, sweep/floor flags, premium, and stock
-price.  Dedup is done client-side by alert ID — each poll fetches the
-latest batch and skips any IDs already seen.
+price.
+
+Dedup strategy (two layers):
+  1. Server-side: ``newer_than`` set to the max ``created_at`` from the
+     previous response so the API only returns alerts created since then.
+  2. Client-side: ``_seen_ids`` set of alert UUIDs as a safety net to
+     never process the same alert twice.
+
 Includes retry with exponential backoff (2 retries, 2s base).
 """
 from __future__ import annotations
 
 import asyncio
-import time
+from datetime import datetime, timezone
 
 import httpx
 
@@ -25,9 +31,11 @@ BASE_URL = "https://api.unusualwhales.com/api"
 MAX_RETRIES = 2
 RETRY_BASE_DELAY = 2  # seconds, exponential
 
-# Seen alert IDs — persists across calls within the same process.
-# First call after restart processes all returned alerts; subsequent
-# calls skip any already-seen IDs.
+# Server-side cursor: unix seconds of the max created_at from the
+# previous response.  newer_than filters on created_at (NOT start_time).
+_newer_than_ts: int = 0
+
+# Client-side safety net: set of alert IDs already processed.
 _seen_ids: set[str] = set()
 
 
@@ -45,12 +53,16 @@ class UnusualWhalesClient:
         }
 
     async def fetch_flow(self) -> list[FlowSignal]:
-        """Fetch new flow alerts, skipping any already seen by ID.
+        """Fetch new flow alerts since the last poll.
 
-        Polls /option-trades/flow-alerts each cycle and filters out
-        alerts whose `id` is already in `_seen_ids`.  No timestamp
-        watermarking — simple, reliable ID-based dedup.
+        Two-layer dedup:
+          1. ``newer_than`` (server-side) — set to the max ``created_at``
+             from the previous response so only new alerts are returned.
+          2. ``_seen_ids`` (client-side) — skip any alert ID already
+             processed, as a safety net for edge cases.
         """
+        global _newer_than_ts
+
         params: dict = {
             "limit": self._flow_cfg.scan_limit,
             "min_premium": self._flow_cfg.min_premium,
@@ -59,6 +71,11 @@ class UnusualWhalesClient:
         # Filter to common stocks only
         if self._flow_cfg.issue_types:
             params["issue_types[]"] = ",".join(self._flow_cfg.issue_types)
+
+        # Server-side cursor: only fetch alerts created after our last poll.
+        # newer_than filters on created_at (NOT start_time).
+        if _newer_than_ts > 0:
+            params["newer_than"] = str(_newer_than_ts)
 
         # Additional API-level filters
         if self._flow_cfg.min_dte > 0:
@@ -96,7 +113,24 @@ class UnusualWhalesClient:
         if isinstance(flows, dict):
             flows = [flows]
 
-        # Filter to only new (unseen) alerts
+        # Advance the server-side cursor to the max created_at so the
+        # next poll only gets alerts created after this point.
+        if flows:
+            max_created = 0
+            for item in flows:
+                created = item.get("created_at", "")
+                if created:
+                    try:
+                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        ts = int(dt.timestamp())
+                        if ts > max_created:
+                            max_created = ts
+                    except (ValueError, TypeError):
+                        pass
+            if max_created > 0:
+                _newer_than_ts = max_created + 1  # exclusive: skip the last seen second
+
+        # Client-side dedup: skip any alert ID already processed
         new_flows = []
         for item in flows:
             alert_id = item.get("id", "")
@@ -109,6 +143,7 @@ class UnusualWhalesClient:
             count=len(flows),
             new=len(new_flows),
             seen_total=len(_seen_ids),
+            newer_than=_newer_than_ts or "none",
         )
 
         signals: list[FlowSignal] = []
