@@ -30,7 +30,7 @@ from services.telegram import TelegramNotifier
 from core.reconciler import reconcile_positions
 from tools.execution_tools import reconcile_orders
 from tools.flow_tools import scan_flow, score_signal, save_signal, send_scan_report
-from tools.position_tools import get_open_positions, check_exit_triggers
+from tools.position_tools import get_open_positions, check_exit_triggers, refresh_positions
 from tools.risk_tools import calculate_portfolio_risk, pre_trade_check
 
 log = get_logger("monitor")
@@ -55,6 +55,7 @@ class MonitorLoop:
         self._last_health_check: datetime | None = None
         self._telegram_bot = TelegramBot()
         self._bot_task: asyncio.Task | None = None
+        self._last_greeks_refresh: datetime | None = None
 
     async def start(self) -> None:
         """Start the monitoring loop. Blocks until shutdown."""
@@ -197,6 +198,15 @@ class MonitorLoop:
                 except Exception as e:
                     log.warning("scan_report_failed", error=str(e))
 
+            # Step 3b: Refresh Greeks, prices, and P&L for open positions
+            if self._should_refresh_greeks():
+                try:
+                    refresh_result = refresh_positions()
+                    self._last_greeks_refresh = datetime.now(pytz.UTC)
+                    log.info("greeks_refreshed", cycle=self._cycle_count, result=refresh_result)
+                except Exception as e:
+                    log.error("greeks_refresh_failed", error=str(e))
+
             # Step 4: Portfolio risk assessment
             risk_assessment = calculate_portfolio_risk()
 
@@ -310,6 +320,13 @@ class MonitorLoop:
             log.info("position_check_done", positions=len(positions), triggers=len(triggered))
         except Exception as e:
             log.error("position_check_error", error=str(e))
+
+    def _should_refresh_greeks(self) -> bool:
+        """Check if enough time has passed to refresh Greeks."""
+        if self._last_greeks_refresh is None:
+            return True
+        elapsed = (datetime.now(pytz.UTC) - self._last_greeks_refresh).total_seconds()
+        return elapsed >= self.settings.monitor.greeks_snapshot_interval_seconds
 
     def _is_market_open(self) -> bool:
         """Check if we're within market trading hours (with holiday awareness)."""
@@ -426,7 +443,7 @@ class MonitorLoop:
             session.close()
 
     def _get_scan_interval(self) -> int:
-        """Get adaptive scan interval based on time of day."""
+        """Get adaptive scan interval based on time of day and open positions."""
         mh = self.settings.market_hours
         flow = self.settings.flow
         tz = pytz.timezone(mh.timezone)
@@ -440,8 +457,23 @@ class MonitorLoop:
 
         if minutes_since_open < 30 or minutes_to_close < 30:
             return flow.adaptive_scan_min_interval
-        else:
-            return self.settings.monitor.poll_interval_seconds
+
+        base_interval = self.settings.monitor.poll_interval_seconds
+
+        # Halve poll interval when open positions exist for more frequent
+        # exit trigger, P&L, and risk checks
+        session = get_session()
+        try:
+            has_open = session.query(PositionRecord).filter(
+                PositionRecord.status == PositionStatus.OPEN
+            ).first() is not None
+        finally:
+            session.close()
+
+        if has_open:
+            return base_interval // 2
+
+        return base_interval
 
     async def _shutdown(self) -> None:
         """Clean shutdown."""

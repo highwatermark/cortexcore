@@ -122,8 +122,12 @@ async def reconcile_positions() -> dict:
                     db_pos.current_price = broker_pos.current_price
                     db_pos.current_value = broker_pos.current_price * db_pos.quantity * 100
 
-            # Always update DB with latest broker price
+            # Always update DB with latest broker price and P&L
             db_pos.current_price = broker_pos.current_price
+            db_pos.current_value = broker_pos.current_price * db_pos.quantity * 100
+            if db_pos.entry_price and db_pos.entry_price > 0:
+                db_pos.pnl_pct = ((broker_pos.current_price - db_pos.entry_price) / db_pos.entry_price) * 100
+                db_pos.pnl_dollars = (broker_pos.current_price - db_pos.entry_price) * db_pos.quantity * 100
             db_pos.last_checked = datetime.now(timezone.utc)
 
         session.commit()

@@ -16,6 +16,7 @@ from data.models import (
     get_session,
 )
 from services.alpaca_broker import AlpacaBroker
+from services.alpaca_options_data import get_options_data_client
 
 log = get_logger("position_tools")
 
@@ -190,6 +191,110 @@ def update_position_price(position_id: str, current_price: float) -> bool:
         session.rollback()
         log.error("position_update_error", position_id=position_id, error=str(e))
         return False
+    finally:
+        session.close()
+
+
+def update_position_greeks(
+    position_id: str,
+    delta: float | None = None,
+    gamma: float | None = None,
+    theta: float | None = None,
+    vega: float | None = None,
+    iv: float | None = None,
+) -> bool:
+    """Update a position's Greeks and IV in the database."""
+    session = get_session()
+    try:
+        pos = session.query(PositionRecord).filter(PositionRecord.position_id == position_id).first()
+        if not pos:
+            return False
+
+        if delta is not None:
+            pos.delta = delta
+        if gamma is not None:
+            pos.gamma = gamma
+        if theta is not None:
+            pos.theta = theta
+        if vega is not None:
+            pos.vega = vega
+        if iv is not None:
+            pos.iv = iv
+        pos.last_checked = datetime.now(timezone.utc)
+        session.commit()
+        return True
+    except Exception as e:
+        session.rollback()
+        log.error("greeks_update_error", position_id=position_id, error=str(e))
+        return False
+    finally:
+        session.close()
+
+
+def refresh_positions() -> dict:
+    """Fetch snapshots for all open positions and persist price, P&L, and Greeks.
+
+    Makes a single batch API call via AlpacaOptionsData, then updates each
+    position in the database.
+
+    Returns summary dict with counts.
+    """
+    session = get_session()
+    try:
+        open_positions = (
+            session.query(PositionRecord)
+            .filter(PositionRecord.status == PositionStatus.OPEN)
+            .all()
+        )
+
+        if not open_positions:
+            return {"positions": 0, "updated": 0, "errors": 0}
+
+        symbols = [p.option_symbol for p in open_positions]
+        data_client = get_options_data_client()
+        snapshots = data_client.get_snapshots(symbols)
+
+        updated = 0
+        errors = 0
+        for pos in open_positions:
+            snap = snapshots.get(pos.option_symbol)
+            if not snap:
+                continue
+
+            try:
+                price = snap["current_price"]
+                pos.current_price = price
+                pos.current_value = price * pos.quantity * 100
+                if pos.entry_price and pos.entry_price > 0:
+                    pos.pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
+                    pos.pnl_dollars = (price - pos.entry_price) * pos.quantity * 100
+
+                if snap.get("delta") is not None:
+                    pos.delta = snap["delta"]
+                if snap.get("gamma") is not None:
+                    pos.gamma = snap["gamma"]
+                if snap.get("theta") is not None:
+                    pos.theta = snap["theta"]
+                if snap.get("vega") is not None:
+                    pos.vega = snap["vega"]
+                if snap.get("iv") is not None:
+                    pos.iv = snap["iv"]
+
+                pos.last_checked = datetime.now(timezone.utc)
+                updated += 1
+            except Exception as e:
+                errors += 1
+                log.error("position_refresh_error", position_id=pos.position_id, error=str(e))
+
+        session.commit()
+
+        summary = {"positions": len(open_positions), "updated": updated, "errors": errors}
+        log.info("positions_refreshed", **summary)
+        return summary
+    except Exception as e:
+        session.rollback()
+        log.error("refresh_positions_failed", error=str(e))
+        return {"positions": 0, "updated": 0, "errors": 0, "error": str(e)}
     finally:
         session.close()
 
