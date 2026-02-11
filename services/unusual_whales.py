@@ -111,8 +111,13 @@ class UnusualWhalesClient:
             newer_than=int(_last_scan_ts) if _last_scan_ts > 0 else "none",
         )
 
-        # Advance the watermark so the next poll only gets newer alerts
-        _last_scan_ts = scan_start
+        # Advance the watermark only if we got results; otherwise hold back
+        # so the next poll can catch alerts that arrive in the gap.
+        if flows:
+            _last_scan_ts = scan_start
+        elif _last_scan_ts > 0:
+            # Cap staleness: don't look back more than 5 minutes
+            _last_scan_ts = max(_last_scan_ts, scan_start - 300)
 
         signals: list[FlowSignal] = []
         for item in flows:

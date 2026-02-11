@@ -32,6 +32,10 @@ You decide when to scan for new flow based on:
 - Current position count (if max positions, reduce scanning)
 - Default: 30s near open, 120s in afternoon
 
+## Scan Reporting
+
+After every scan cycle where signals are found and scored, you MUST call `send_scan_report` to send a Telegram digest of what was scored and why signals passed or failed. This helps the user monitor the system in real-time.
+
 ## Risk-First Approach
 
 - ALWAYS evaluate risk before considering reward
