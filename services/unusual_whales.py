@@ -3,8 +3,8 @@ Unusual Whales API client for options flow data.
 
 Uses the /option-trades/flow-alerts endpoint which provides per-alert
 flow data including volume, OI, sweep/floor flags, premium, and stock
-price.  The `newer_than` query parameter acts as a high-watermark so
-each poll only returns alerts created after the previous scan.
+price.  Dedup is done client-side by alert ID — each poll fetches the
+latest batch and skips any IDs already seen.
 Includes retry with exponential backoff (2 retries, 2s base).
 """
 from __future__ import annotations
@@ -25,10 +25,10 @@ BASE_URL = "https://api.unusualwhales.com/api"
 MAX_RETRIES = 2
 RETRY_BASE_DELAY = 2  # seconds, exponential
 
-# Module-level high-watermark (unix seconds).
-# Persists across calls within the same process; resets on restart
-# (first call after restart does one full fetch, then incrementals).
-_last_scan_ts: float = 0.0
+# Seen alert IDs — persists across calls within the same process.
+# First call after restart processes all returned alerts; subsequent
+# calls skip any already-seen IDs.
+_seen_ids: set[str] = set()
 
 
 class UnusualWhalesClient:
@@ -45,15 +45,12 @@ class UnusualWhalesClient:
         }
 
     async def fetch_flow(self) -> list[FlowSignal]:
-        """Fetch new flow alerts since the last scan.
+        """Fetch new flow alerts, skipping any already seen by ID.
 
-        Uses /option-trades/flow-alerts with the `newer_than` parameter
-        so each poll only returns alerts created after the previous scan.
-        On the first call after startup, fetches the most recent batch
-        without a time filter.
+        Polls /option-trades/flow-alerts each cycle and filters out
+        alerts whose `id` is already in `_seen_ids`.  No timestamp
+        watermarking — simple, reliable ID-based dedup.
         """
-        global _last_scan_ts
-
         params: dict = {
             "limit": self._flow_cfg.scan_limit,
             "min_premium": self._flow_cfg.min_premium,
@@ -62,10 +59,6 @@ class UnusualWhalesClient:
         # Filter to common stocks only
         if self._flow_cfg.issue_types:
             params["issue_types[]"] = ",".join(self._flow_cfg.issue_types)
-
-        # High-watermark: only fetch alerts newer than our last scan
-        if _last_scan_ts > 0:
-            params["newer_than"] = str(int(_last_scan_ts))
 
         # Additional API-level filters
         if self._flow_cfg.min_dte > 0:
@@ -76,8 +69,6 @@ class UnusualWhalesClient:
             params["all_opening"] = "true"
         if self._flow_cfg.min_vol_oi_ratio > 0:
             params["min_volume_oi_ratio"] = str(self._flow_cfg.min_vol_oi_ratio)
-
-        scan_start = time.time()
 
         last_error = None
         for attempt in range(MAX_RETRIES + 1):
@@ -105,37 +96,30 @@ class UnusualWhalesClient:
         if isinstance(flows, dict):
             flows = [flows]
 
+        # Filter to only new (unseen) alerts
+        new_flows = []
+        for item in flows:
+            alert_id = item.get("id", "")
+            if alert_id and alert_id not in _seen_ids:
+                new_flows.append(item)
+                _seen_ids.add(alert_id)
+
         log.info(
             "uw_flow_fetched",
             count=len(flows),
-            newer_than=int(_last_scan_ts) if _last_scan_ts > 0 else "none",
+            new=len(new_flows),
+            seen_total=len(_seen_ids),
         )
 
-        # Advance the watermark to the latest alert timestamp so the next
-        # poll picks up only genuinely new alerts.  start_time is millis.
-        if flows:
-            max_alert_ts = max(
-                (int(item.get("start_time", 0)) // 1000 for item in flows if item.get("start_time")),
-                default=0,
-            )
-            if max_alert_ts > 0:
-                _last_scan_ts = max_alert_ts
-            else:
-                # Fallback: no start_time in response — hold watermark steady
-                log.warning("uw_no_start_time", sample_keys=list(flows[0].keys())[:10])
-        elif _last_scan_ts > 0:
-            # Cap staleness: don't look back more than 5 minutes
-            _last_scan_ts = max(_last_scan_ts, scan_start - 300)
-
         signals: list[FlowSignal] = []
-        for item in flows:
+        for item in new_flows:
             if not isinstance(item, dict):
                 continue
             signal = self._parse_flow_alert(item)
             if signal is not None:
                 signals.append(signal)
 
-        log.info("uw_signals_parsed", total=len(flows), passed_filter=len(signals))
+        log.info("uw_signals_parsed", total=len(new_flows), passed_filter=len(signals))
         return signals
 
     async def get_option_contracts(self, ticker: str) -> list[dict]:
