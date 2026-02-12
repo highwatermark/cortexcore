@@ -529,14 +529,31 @@ class TelegramBot:
             session.close()
 
     async def _cmd_flow(self, args: list[str]) -> str:
-        """Trigger a manual flow scan via the orchestrator."""
-        from agents.orchestrator import Orchestrator
+        """Trigger a manual flow scan using the deterministic pipeline."""
+        from tools.flow_tools import scan_flow, score_signal
 
+        log.info("manual_flow_scan_triggered")
         try:
-            orchestrator = Orchestrator()
-            result = await orchestrator.run_scan_cycle()
-            preview = result[:500] if result else "No result"
-            return f"<b>Flow Scan Complete</b>\n\n{preview}"
+            signals = await scan_flow()
+            if not signals:
+                return "<b>Flow Scan Complete</b>\n\nNo new signals found."
+
+            lines = [f"<b>Flow Scan Complete</b>  ({len(signals)} signals)\n"]
+            for sig in signals:
+                result = score_signal(sig)
+                ticker = sig.get("ticker", "?")
+                opt = sig.get("option_type", "?")
+                strike = sig.get("strike", 0)
+                dte = sig.get("dte", 0)
+                prem = sig.get("premium", 0)
+                score = result.get("score", 0)
+                passed = "PASS" if result.get("passed") else "FAIL"
+                lines.append(
+                    f"  <b>{ticker}</b> {opt} ${strike:.0f}  DTE {dte}\n"
+                    f"    ${prem:,.0f}  Score <b>{score}/10</b> [{passed}]"
+                )
+
+            return "\n".join(lines)
         except Exception as e:
             return f"Flow scan failed: {str(e)[:200]}"
 

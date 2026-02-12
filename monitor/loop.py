@@ -15,8 +15,6 @@ import asyncio
 import signal
 from datetime import datetime, timezone
 
-import pytz
-
 from agents.orchestrator import Orchestrator
 from bot.commands import TelegramBot
 from config.settings import get_settings
@@ -26,6 +24,7 @@ from core.killswitch import is_killed
 from core.logger import bind_cycle_id, get_logger
 from data.models import PositionRecord, PositionStatus, TradeLog, get_session
 from services.alpaca_broker import get_broker
+from core.utils import TZ
 from services.telegram import TelegramNotifier
 from core.reconciler import reconcile_positions
 from tools.execution_tools import reconcile_orders
@@ -162,6 +161,7 @@ class MonitorLoop:
         self._cycle_count += 1
         bind_cycle_id(self._cycle_count)
         interval = self._get_scan_interval()
+        log.info("scan_interval", interval_seconds=interval, cycle=self._cycle_count)
 
         try:
             # Reconcile any pending orders each cycle
@@ -343,8 +343,7 @@ class MonitorLoop:
     def _is_market_open(self) -> bool:
         """Check if we're within market trading hours (with holiday awareness)."""
         mh = self.settings.market_hours
-        tz = pytz.timezone(mh.timezone)
-        now = datetime.now(tz)
+        now = datetime.now(TZ)
 
         # Skip weekends
         if now.weekday() >= 5:
@@ -372,8 +371,7 @@ class MonitorLoop:
             return False
 
         mh = self.settings.market_hours
-        tz = pytz.timezone(mh.timezone)
-        now = datetime.now(tz)
+        now = datetime.now(TZ)
 
         market_close = now.replace(hour=mh.close_hour, minute=mh.close_minute, second=0, microsecond=0)
         minutes_past_close = (now - market_close).total_seconds() / 60
@@ -458,8 +456,7 @@ class MonitorLoop:
         """Get adaptive scan interval based on time of day and open positions."""
         mh = self.settings.market_hours
         flow = self.settings.flow
-        tz = pytz.timezone(mh.timezone)
-        now = datetime.now(tz)
+        now = datetime.now(TZ)
 
         market_open = now.replace(hour=mh.open_hour, minute=mh.open_minute, second=0)
         market_close = now.replace(hour=mh.close_hour, minute=mh.close_minute, second=0)

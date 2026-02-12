@@ -14,7 +14,7 @@ from data.models import (
     RiskLevel,
     get_session,
 )
-from services.alpaca_broker import AlpacaBroker
+from services.alpaca_broker import get_broker
 
 log = get_logger("risk_tools")
 
@@ -34,14 +34,25 @@ def calculate_portfolio_risk() -> dict:
     risk_cfg = settings.risk
 
     # Get account equity for normalization
-    broker = AlpacaBroker()
     try:
-        account = broker.get_account()
-        equity = account.get("equity", 100_000)
+        account = get_broker().get_account()
+        equity = account.get("equity", 0)
     except Exception:
-        equity = 100_000  # fallback
+        equity = 0
 
-    scaling = equity / 100_000  # normalize to per-$100K
+    if equity <= 0:
+        log.warning("risk_equity_unavailable", equity=equity)
+        # Return safe defaults — don't allow new positions
+        return {
+            "risk_score": 100,
+            "risk_level": "CRITICAL",
+            "position_count": 0,
+            "risk_capacity_pct": 0,
+            "can_add_position": False,
+            "warnings": ["Cannot verify equity — broker unreachable or zero equity"],
+        }
+
+    scaling = max(equity, 1) / 100_000  # normalize to per-$100K, guard ZeroDivision
 
     # Get open positions from DB
     session = get_session()
@@ -67,6 +78,17 @@ def calculate_portfolio_risk() -> dict:
         max_concentration = 0.0
         if total_value > 0:
             max_concentration = max(underlying_values.values(), default=0) / total_value
+
+        log.debug(
+            "risk_inputs",
+            equity=equity,
+            position_count=len(positions),
+            total_delta=round(total_delta, 4),
+            total_gamma=round(total_gamma, 4),
+            total_theta=round(total_theta, 4),
+            max_concentration=round(max_concentration, 4),
+            total_value=round(total_value, 2),
+        )
 
         # Score components (each 0-25)
         delta_score = min(25, int(25 * (total_delta / scaling) / risk_cfg.max_portfolio_delta_per_100k))

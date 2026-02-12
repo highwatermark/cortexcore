@@ -22,7 +22,7 @@ import httpx
 
 from config.settings import get_settings
 from core.logger import get_logger
-from core.utils import calc_dte, parse_occ_symbol
+from core.utils import calc_dte, parse_occ_symbol, trading_now
 from data.models import FlowSignal, SignalAction
 
 log = get_logger("uw_client")
@@ -30,6 +30,7 @@ log = get_logger("uw_client")
 BASE_URL = "https://api.unusualwhales.com/api"
 MAX_RETRIES = 2
 RETRY_BASE_DELAY = 2  # seconds, exponential
+WATERMARK_BUFFER_SECONDS = 300  # 5 minutes — don't advance past now minus this buffer
 
 # Server-side cursor: unix seconds of the max created_at from the
 # previous response.  newer_than filters on created_at (NOT start_time).
@@ -87,6 +88,8 @@ class UnusualWhalesClient:
         if self._flow_cfg.min_vol_oi_ratio > 0:
             params["min_volume_oi_ratio"] = str(self._flow_cfg.min_vol_oi_ratio)
 
+        log.debug("uw_api_query", params=params)
+
         last_error = None
         for attempt in range(MAX_RETRIES + 1):
             try:
@@ -113,8 +116,21 @@ class UnusualWhalesClient:
         if isinstance(flows, dict):
             flows = [flows]
 
+        # Detect possible truncation — if we got exactly `limit` results,
+        # there may be more alerts we didn't see.
+        scan_limit = self._flow_cfg.scan_limit
+        if len(flows) >= scan_limit:
+            log.warning(
+                "uw_possible_truncation",
+                returned=len(flows),
+                limit=scan_limit,
+                msg="Returned count equals limit — some alerts may be missing",
+            )
+
         # Advance the server-side cursor to the max created_at so the
         # next poll only gets alerts created after this point.
+        # Apply a 5-minute buffer to avoid skipping alerts that UW
+        # hasn't finished processing yet.
         if flows:
             max_created = 0
             for item in flows:
@@ -128,7 +144,13 @@ class UnusualWhalesClient:
                     except (ValueError, TypeError):
                         pass
             if max_created > 0:
-                _newer_than_ts = max_created + 1  # exclusive: skip the last seen second
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                buffered_ts = now_ts - WATERMARK_BUFFER_SECONDS
+                # Don't advance past (now - buffer) to catch late-arriving alerts
+                new_watermark = min(max_created + 1, buffered_ts)
+                # Never move the watermark backwards
+                if new_watermark > _newer_than_ts:
+                    _newer_than_ts = new_watermark
 
         # Client-side dedup: skip any alert ID already processed
         new_flows = []
@@ -147,13 +169,18 @@ class UnusualWhalesClient:
         )
 
         signals: list[FlowSignal] = []
+        drop_reasons: dict[str, int] = {}
         for item in new_flows:
             if not isinstance(item, dict):
                 continue
-            signal = self._parse_flow_alert(item)
+            signal, reason = self._parse_flow_alert(item)
             if signal is not None:
                 signals.append(signal)
+            elif reason:
+                drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
 
+        if drop_reasons:
+            log.info("uw_filter_drops", drops=drop_reasons)
         log.info("uw_signals_parsed", total=len(new_flows), passed_filter=len(signals))
         return signals
 
@@ -192,8 +219,8 @@ class UnusualWhalesClient:
             log.warning("earnings_fetch_failed", ticker=ticker, error=str(e))
             return None
 
-    def _parse_flow_alert(self, item: dict) -> FlowSignal | None:
-        """Parse a flow-alert into a FlowSignal, or None if filtered out.
+    def _parse_flow_alert(self, item: dict) -> tuple[FlowSignal | None, str]:
+        """Parse a flow-alert into a FlowSignal, or (None, reason) if filtered out.
 
         The /option-trades/flow-alerts response uses different field names
         than the screener endpoint (e.g. ``ticker`` not ``ticker_symbol``,
@@ -203,19 +230,22 @@ class UnusualWhalesClient:
 
         # Filter excluded tickers
         if ticker in self._excluded or not ticker:
-            return None
+            log.debug("filter_drop", ticker=ticker or "empty", reason="excluded_or_empty")
+            return None, "excluded_or_empty"
 
         # Filter issue type
         issue_type = item.get("issue_type", "")
         if issue_type and issue_type not in self._flow_cfg.issue_types:
-            return None
+            log.debug("filter_drop", ticker=ticker, reason="issue_type", value=issue_type)
+            return None, "issue_type"
 
         # Parse OCC symbol for strike/expiration/type
         # flow-alerts uses "option_chain" for the OCC symbol
         occ_sym = item.get("option_chain", "") or item.get("option_symbol", "")
         parsed = parse_occ_symbol(occ_sym)
         if not parsed:
-            return None
+            log.debug("filter_drop", ticker=ticker, reason="bad_occ_symbol", value=occ_sym)
+            return None, "bad_occ_symbol"
 
         option_type = parsed.option_type
         strike = parsed.strike
@@ -225,33 +255,39 @@ class UnusualWhalesClient:
         try:
             premium = float(item.get("total_premium", 0) or item.get("premium", 0) or 0)
         except (ValueError, TypeError):
-            return None
+            log.debug("filter_drop", ticker=ticker, reason="bad_premium")
+            return None, "bad_premium"
         if premium < self._flow_cfg.min_premium:
-            return None
+            log.debug("filter_drop", ticker=ticker, reason="low_premium", value=premium)
+            return None, "low_premium"
 
         # Parse volume/OI
         volume = int(float(item.get("volume", 0) or 0))
         oi = int(float(item.get("open_interest", 0) or 0))
         if oi < self._flow_cfg.min_open_interest:
-            return None
+            log.debug("filter_drop", ticker=ticker, reason="low_oi", value=oi)
+            return None, "low_oi"
 
         vol_oi = float(item.get("volume_oi_ratio", 0) or 0)
         if vol_oi == 0 and oi > 0:
             vol_oi = volume / oi
         if vol_oi < self._flow_cfg.min_vol_oi_ratio:
-            return None
+            log.debug("filter_drop", ticker=ticker, reason="low_vol_oi", value=vol_oi)
+            return None, "low_vol_oi"
 
         # DTE check
         dte = calc_dte(expiration)
         if dte < self._flow_cfg.min_dte or dte > self._flow_cfg.max_dte:
-            return None
+            log.debug("filter_drop", ticker=ticker, reason="dte_out_of_range", dte=dte)
+            return None, "dte_out_of_range"
 
         # Underlying price and strike distance
         underlying_price = float(item.get("underlying_price", 0) or item.get("stock_price", 0) or 0)
         if underlying_price > 0 and strike > 0:
             distance = abs(strike - underlying_price) / underlying_price
             if distance > self._flow_cfg.max_strike_distance_pct:
-                return None
+                log.debug("filter_drop", ticker=ticker, reason="strike_distance", distance=f"{distance:.2%}")
+                return None, "strike_distance"
 
         # Order type from boolean flags (flow-alerts format)
         order_parts: list[str] = []
@@ -300,4 +336,4 @@ class UnusualWhalesClient:
             has_multileg=has_multileg,
             trade_count=trade_count,
             next_earnings_date="",  # Fetched separately via get_next_earnings_date
-        )
+        ), ""

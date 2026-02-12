@@ -19,11 +19,12 @@ log = get_logger("flow_tools")
 # Accumulate scored signals per scan cycle for Telegram digest
 _scan_scored_signals: list[tuple[dict, dict]] = []  # (signal, score_result)
 
-# High-watermark: track contracts already scored today so we don't rescore
-# the same contract (e.g. FI CALL $230 2026-03-20) on every poll cycle.
-# Keyed by "TICKER:TYPE:STRIKE:EXPIRATION", resets each trading day.
-_seen_contracts: set[str] = set()
-_seen_date: str = ""  # YYYY-MM-DD in ET, used to reset daily
+# High-watermark: track contracts scored today with their best premium so we
+# skip re-scoring unless the new signal has higher premium (indicating a
+# bigger institutional bet that could score higher).
+# Keyed by "TICKER:TYPE:STRIKE:EXPIRATION" → best premium, resets each trading day.
+_seen_contracts: dict[str, float] = {}
+_seen_date: str = ""  # YYYY-MM-DD in PT, used to reset daily
 
 
 def _contract_key(sig: FlowSignal) -> str:
@@ -57,10 +58,20 @@ async def scan_flow() -> list[dict]:
     skipped = 0
     for sig in signals[: get_settings().flow.max_analyze]:
         key = _contract_key(sig)
-        if key in _seen_contracts:
+        prev_premium = _seen_contracts.get(key)
+        if prev_premium is not None and sig.premium <= prev_premium:
+            # Already scored with equal or higher premium — skip
             skipped += 1
             continue
-        _seen_contracts.add(key)
+        # New contract or higher premium — allow rescoring
+        if prev_premium is not None:
+            log.info(
+                "rescore_premium_increase",
+                contract=key,
+                old_premium=prev_premium,
+                new_premium=sig.premium,
+            )
+        _seen_contracts[key] = sig.premium
         results.append(sig.model_dump())
 
     log.info(
@@ -176,16 +187,14 @@ def score_signal(signal: dict) -> dict:
         "min_required": settings.flow.min_score,
     }
 
-    if directional_pct > 0:
-        log.info(
-            "signal_scored",
-            ticker=result["ticker"],
-            score=score,
-            passed=passed,
-            direction=f"{directional_pct:.0%} {directional_side} side",
-        )
-    else:
-        log.info("signal_scored", ticker=result["ticker"], score=score, passed=passed)
+    log.info(
+        "signal_scored",
+        ticker=result["ticker"],
+        score=score,
+        passed=passed,
+        breakdown=result["breakdown"],
+        direction=f"{directional_pct:.0%} {directional_side} side" if directional_pct > 0 else "none",
+    )
 
     # Accumulate for Telegram digest
     _scan_scored_signals.append((signal, result))

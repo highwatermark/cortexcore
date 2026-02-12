@@ -11,10 +11,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from core.logger import get_logger
+from core.utils import ensure_utc
 from data.models import (
     PositionRecord,
     PositionStatus,
     SignalAction,
+    TradeLog,
     get_session,
 )
 from services.alpaca_broker import get_broker
@@ -97,10 +99,45 @@ async def reconcile_positions() -> dict:
                 )
                 db_pos.status = PositionStatus.CLOSED
                 db_pos.closed_at = datetime.now(timezone.utc)
+
+                # Create TradeLog so losses are visible to circuit breakers
+                # and performance metrics.
+                exit_price = db_pos.current_price or db_pos.entry_price or 0
+                entry_price = db_pos.entry_price or 0
+                pnl_dollars = (exit_price - entry_price) * (db_pos.quantity or 0) * 100 if entry_price else 0
+                pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price else 0
+                hold_hours = 0.0
+                if db_pos.opened_at:
+                    hold_hours = (datetime.now(timezone.utc) - ensure_utc(db_pos.opened_at)).total_seconds() / 3600
+
+                trade = TradeLog(
+                    position_id=db_pos.position_id,
+                    ticker=db_pos.ticker,
+                    action=db_pos.action or SignalAction.CALL,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    quantity=db_pos.quantity or 0,
+                    pnl_dollars=round(pnl_dollars, 2),
+                    pnl_pct=round(pnl_pct, 2),
+                    hold_duration_hours=round(hold_hours, 1),
+                    entry_thesis=db_pos.entry_thesis or "",
+                    exit_reason="phantom_closure_reconciler",
+                    opened_at=db_pos.opened_at or datetime.now(timezone.utc),
+                )
+                session.add(trade)
+                log.warning(
+                    "phantom_closure_pnl",
+                    position_id=db_pos.position_id,
+                    ticker=db_pos.ticker,
+                    pnl_dollars=round(pnl_dollars, 2),
+                    pnl_pct=round(pnl_pct, 2),
+                )
+
                 await notifier.send(
                     f"<b>Phantom Position Closed</b>\n"
                     f"Symbol: {symbol} ({db_pos.ticker})\n"
-                    f"Position {db_pos.position_id} marked CLOSED — not found in broker"
+                    f"Position {db_pos.position_id} marked CLOSED — not found in broker\n"
+                    f"P&L: ${pnl_dollars:+,.2f} ({pnl_pct:+.1f}%)"
                 )
 
         # Check for price drift on matching positions
@@ -121,6 +158,12 @@ async def reconcile_positions() -> dict:
                     )
                     db_pos.current_price = broker_pos.current_price
                     db_pos.current_value = broker_pos.current_price * db_pos.quantity * 100
+                    log.debug(
+                        "price_drift_corrected",
+                        symbol=symbol,
+                        new_price=broker_pos.current_price,
+                        new_value=broker_pos.current_price * db_pos.quantity * 100,
+                    )
 
             # Always update DB with latest broker price and P&L
             db_pos.current_price = broker_pos.current_price

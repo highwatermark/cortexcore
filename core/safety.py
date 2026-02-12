@@ -7,14 +7,11 @@ the trade does not happen.
 """
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
-
-import pytz
 
 from config.settings import EXCLUDED_TICKERS, get_settings
 from core.logger import get_logger
+from core.utils import TZ
 from data.models import (
     IntentStatus,
     OrderIntent,
@@ -23,9 +20,6 @@ from data.models import (
     TradeLog,
     get_session,
 )
-
-# Cache for earnings dates: {ticker: (date_str_or_None, fetched_at)}
-_earnings_cache: dict[str, tuple[str | None, datetime]] = {}
 
 log = get_logger("safety_gate")
 
@@ -67,7 +61,18 @@ class SafetyGate:
                 log.warning("safety_gate_blocked", check=check_fn.__name__, reason=reason, ticker=signal.get("ticker", ""))
                 return False, reason
 
-        log.info("safety_gate_passed", ticker=signal.get("ticker", ""))
+        session = get_session()
+        try:
+            _pos_count = session.query(PositionRecord).filter(PositionRecord.status == PositionStatus.OPEN).count()
+        finally:
+            session.close()
+        log.info(
+            "safety_gate_passed",
+            ticker=signal.get("ticker", ""),
+            position_count=_pos_count,
+            quantity=signal.get("quantity", 0),
+            limit_price=signal.get("limit_price", 0),
+        )
         return True, "All safety checks passed"
 
     def _check_excluded_ticker(self, signal: dict) -> tuple[bool, str]:
@@ -111,15 +116,19 @@ class SafetyGate:
             from services.alpaca_broker import get_broker
             try:
                 account = get_broker().get_account()
-                equity = account.get("equity", 100_000)
+                equity = account.get("equity", 0)
             except Exception:
-                equity = 100_000
+                return False, "Cannot verify equity — broker unreachable"
+
+            if equity <= 0:
+                return False, "Cannot verify equity — broker returned zero"
 
             new_total = total_exposure + proposed_value
             exposure_pct = new_total / equity if equity > 0 else 1.0
 
             if exposure_pct > max_pct:
                 return False, f"Total exposure {exposure_pct:.0%} would exceed {max_pct:.0%} limit"
+            log.debug("exposure_check_passed", exposure_pct=f"{exposure_pct:.1%}", max_pct=f"{max_pct:.0%}", current_exposure=total_exposure, proposed=proposed_value)
             return True, ""
         finally:
             session.close()
@@ -169,13 +178,17 @@ class SafetyGate:
 
             from services.alpaca_broker import get_broker
             try:
-                equity = get_broker().get_account().get("equity", 100_000)
+                equity = get_broker().get_account().get("equity", 0)
             except Exception:
-                equity = 100_000
+                return False, "Cannot verify equity — broker unreachable"
+
+            if equity <= 0:
+                return False, "Cannot verify equity — broker returned zero"
 
             loss_pct = abs(total_loss) / equity if equity > 0 else 0
             if loss_pct >= max_loss_pct:
                 return False, f"Daily loss {loss_pct:.1%} >= {max_loss_pct:.0%} limit (${abs(total_loss):.0f})"
+            log.debug("daily_loss_check_passed", loss_pct=f"{loss_pct:.1%}", max_pct=f"{max_loss_pct:.0%}", total_loss=total_loss)
             return True, ""
         finally:
             session.close()
@@ -197,13 +210,17 @@ class SafetyGate:
 
             from services.alpaca_broker import get_broker
             try:
-                equity = get_broker().get_account().get("equity", 100_000)
+                equity = get_broker().get_account().get("equity", 0)
             except Exception:
-                equity = 100_000
+                return False, "Cannot verify equity — broker unreachable"
+
+            if equity <= 0:
+                return False, "Cannot verify equity — broker returned zero"
 
             loss_pct = abs(total_loss) / equity if equity > 0 else 0
             if loss_pct >= max_loss_pct:
                 return False, f"Weekly loss {loss_pct:.1%} >= {max_loss_pct:.0%} limit"
+            log.debug("weekly_loss_check_passed", loss_pct=f"{loss_pct:.1%}", max_pct=f"{max_loss_pct:.0%}", total_loss=total_loss)
             return True, ""
         finally:
             session.close()
@@ -260,8 +277,10 @@ class SafetyGate:
     def _check_earnings_blackout(self, signal: dict) -> tuple[bool, str]:
         """Block entries within N days of earnings.
 
-        Uses cached earnings data from UW API. Fail-open: if earnings data
-        unavailable, trade is allowed (data issue, not safety issue).
+        The earnings date is passed in the signal dict (populated by the
+        flow scanner via FlowSignal.next_earnings_date). This avoids the
+        previous broken pattern of calling an async API from sync context.
+        Fail-open: if earnings data unavailable, trade is allowed.
         """
         blackout_days = self._settings.trading.earnings_blackout_days
         if blackout_days <= 0:
@@ -271,44 +290,12 @@ class SafetyGate:
         if not ticker:
             return True, ""
 
-        # Check cache first (cache per day)
-        global _earnings_cache
-        now = datetime.now(timezone.utc)
-        cached = _earnings_cache.get(ticker)
-        if cached:
-            earnings_date_str, fetched_at = cached
-            # Cache valid for 24 hours
-            if (now - fetched_at).total_seconds() < 86400:
-                if earnings_date_str:
-                    return self._evaluate_earnings_blackout(earnings_date_str, blackout_days, ticker)
-                return True, ""  # No earnings data cached
+        earnings_date_str = signal.get("next_earnings_date", "")
+        if earnings_date_str:
+            log.debug("earnings_blackout_checking", ticker=ticker, next_earnings_date=earnings_date_str)
+            return self._evaluate_earnings_blackout(earnings_date_str, blackout_days, ticker)
 
-        # Try to fetch earnings date (async in sync context)
-        try:
-            from services.unusual_whales import UnusualWhalesClient
-            client = UnusualWhalesClient()
-            # Run async call - use existing event loop if available
-            try:
-                loop = asyncio.get_running_loop()
-                # Already in async context, can't use asyncio.run
-                # Schedule and await
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    earnings_date = loop.run_in_executor(pool, lambda: asyncio.run(client.get_next_earnings_date(ticker)))
-                    # This won't work cleanly in nested async - fall back to cache miss
-                    earnings_date = None
-            except RuntimeError:
-                # No running loop - safe to use asyncio.run
-                earnings_date = asyncio.run(client.get_next_earnings_date(ticker))
-
-            _earnings_cache[ticker] = (earnings_date, now)
-
-            if earnings_date:
-                return self._evaluate_earnings_blackout(earnings_date, blackout_days, ticker)
-        except Exception as e:
-            log.warning("earnings_check_failed", ticker=ticker, error=str(e))
-            # Fail-open: allow trade if we can't check earnings
-
+        log.debug("earnings_blackout_no_data", ticker=ticker)
         return True, ""
 
     def _evaluate_earnings_blackout(self, earnings_date_str: str, blackout_days: int, ticker: str) -> tuple[bool, str]:
@@ -328,8 +315,7 @@ class SafetyGate:
         """Block entries in first/last N minutes of trading day."""
         mh = self._settings.market_hours
         mon = self._settings.monitor
-        tz = pytz.timezone(mh.timezone)
-        now = datetime.now(tz)
+        now = datetime.now(TZ)
 
         market_open = now.replace(hour=mh.open_hour, minute=mh.open_minute, second=0, microsecond=0)
         market_close = now.replace(hour=mh.close_hour, minute=mh.close_minute, second=0, microsecond=0)

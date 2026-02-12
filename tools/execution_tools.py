@@ -201,7 +201,8 @@ async def execute_entry(
 
         order_side = OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL
 
-        # Record intent
+        # Record intent — flush (not commit) so it participates in the
+        # single atomic commit at the end of the happy path.
         intent = OrderIntent(
             idempotency_key=idemp_key,
             signal_id=signal_id,
@@ -214,7 +215,7 @@ async def execute_entry(
             reason=thesis,
         )
         session.add(intent)
-        session.commit()
+        session.flush()
 
         # Submit to broker
         broker = AlpacaBroker()
@@ -229,11 +230,15 @@ async def execute_entry(
             intent.status = IntentStatus.FAILED
             session.commit()
             log.error("entry_failed", ticker=ticker, error=result.error)
-            notifier = TelegramNotifier()
-            await notifier.notify_error("Entry execution", result.error)
+            try:
+                notifier = TelegramNotifier()
+                await notifier.notify_error("Entry execution", result.error)
+            except Exception as ne:
+                log.warning("notify_error_failed", error=str(ne))
             return {"success": False, "error": result.error}
 
-        # Record broker order as SUBMITTED
+        # Record broker order — flush so it participates in the same
+        # atomic commit as the position record below.
         intent.broker_order_id = result.broker_order_id
         broker_order = BrokerOrder(
             broker_order_id=result.broker_order_id,
@@ -247,7 +252,7 @@ async def execute_entry(
             status=OrderStatus.SUBMITTED,
         )
         session.add(broker_order)
-        session.commit()
+        session.flush()
 
         # Poll for fill
         fill_status = await _wait_for_fill(broker, result.broker_order_id)
@@ -284,48 +289,65 @@ async def execute_entry(
             pos_strike = parsed.strike
             pos_expiration = parsed.expiration
 
-        # Use actual fill price if available, otherwise limit price
-        actual_price = filled_price if filled_price else limit_price
-        actual_qty = filled_qty if filled_qty > 0 else quantity
+        # Create position record ONLY when we have confirmed fills.
+        # If the fill poll timed out with filled_qty=0, the order is still
+        # working at the broker — reconcile_orders() will create the
+        # position later once the fill is confirmed.
+        position_id = None
+        if filled_qty > 0:
+            actual_price = filled_price if filled_price else limit_price
+            position_id = uuid4().hex[:16]
+            position = PositionRecord(
+                position_id=position_id,
+                signal_id=signal_id,
+                ticker=ticker,
+                option_symbol=option_symbol,
+                action=pos_action,
+                strike=pos_strike,
+                expiration=pos_expiration,
+                quantity=filled_qty,
+                entry_price=actual_price,
+                entry_value=actual_price * filled_qty * 100,
+                status=PositionStatus.OPEN,
+                entry_thesis=thesis,
+                conviction=conviction,
+            )
+            session.add(position)
 
-        # Create position record
-        position_id = uuid4().hex[:16]
-        position = PositionRecord(
-            position_id=position_id,
-            signal_id=signal_id,
-            ticker=ticker,
-            option_symbol=option_symbol,
-            action=pos_action,
-            strike=pos_strike,
-            expiration=pos_expiration,
-            quantity=actual_qty,
-            entry_price=actual_price,
-            entry_value=actual_price * actual_qty * 100,
-            status=PositionStatus.OPEN,
-            entry_thesis=thesis,
-            conviction=conviction,
-        )
-        session.add(position)
+        # Single atomic commit: intent + broker_order + position (if filled)
         session.commit()
 
-        # Notify
-        notifier = TelegramNotifier()
-        fill_note = ""
-        if filled_qty > 0 and filled_qty < quantity:
-            fill_note = f" (PARTIAL: {filled_qty}/{quantity} filled)"
-        elif filled_qty == 0:
-            fill_note = " (PENDING FILL — order working)"
-
-        await notifier.notify_entry(
-            ticker=ticker,
-            action=order_side.value,
-            strike=pos_strike,
-            expiration=pos_expiration,
-            quantity=actual_qty,
-            price=actual_price,
-            thesis=thesis + fill_note,
-            conviction=conviction,
-        )
+        # Notify — isolated so failures don't affect the committed trade
+        try:
+            notifier = TelegramNotifier()
+            if filled_qty > 0:
+                actual_price = filled_price if filled_price else limit_price
+                fill_note = ""
+                if filled_qty < quantity:
+                    fill_note = f" (PARTIAL: {filled_qty}/{quantity} filled)"
+                await notifier.notify_entry(
+                    ticker=ticker,
+                    action=order_side.value,
+                    strike=pos_strike,
+                    expiration=pos_expiration,
+                    quantity=filled_qty,
+                    price=actual_price,
+                    thesis=thesis + fill_note,
+                    conviction=conviction,
+                )
+            else:
+                await notifier.notify_entry(
+                    ticker=ticker,
+                    action=order_side.value,
+                    strike=pos_strike,
+                    expiration=pos_expiration,
+                    quantity=quantity,
+                    price=limit_price,
+                    thesis=thesis + " (PENDING FILL — order working)",
+                    conviction=conviction,
+                )
+        except Exception as ne:
+            log.warning("notify_entry_failed", ticker=ticker, error=str(ne))
 
         log.info(
             "entry_executed",
@@ -342,8 +364,12 @@ async def execute_entry(
             "position_id": position_id,
             "filled_qty": filled_qty,
             "filled_price": filled_price,
-            "order_status": order_state,
-            "message": f"Order {order_state}: {filled_qty}/{quantity} filled @ ${actual_price:.2f}{fill_note}",
+            "order_status": order_state if filled_qty > 0 else "pending",
+            "message": (
+                f"Order {order_state}: {filled_qty}/{quantity} filled"
+                + (f" @ ${filled_price:.2f}" if filled_price else "")
+                + (" — position created" if position_id else " — reconciler will create position on fill")
+            ),
         }
     except Exception as e:
         session.rollback()
@@ -377,11 +403,19 @@ async def execute_exit(
         if pos.status != PositionStatus.OPEN:
             return {"success": False, "error": f"Position {position_id} is {pos.status.value}"}
 
-        # Idempotency
+        # Idempotency — allow retry when previous attempt failed
         idemp_key = f"exit-{position_id}"
         existing = session.query(OrderIntent).filter(OrderIntent.idempotency_key == idemp_key).first()
-        if existing and existing.status == IntentStatus.EXECUTED:
-            return {"success": False, "error": f"Exit already executed for {position_id}"}
+        if existing:
+            if existing.status == IntentStatus.EXECUTED:
+                return {"success": False, "error": f"Exit already executed for {position_id}"}
+            if existing.status == IntentStatus.FAILED:
+                # Previous attempt failed — remove so we can retry
+                session.delete(existing)
+                session.flush()
+            else:
+                # PENDING — exit order may still be in flight
+                return {"success": False, "error": f"Exit already {existing.status.value.lower()} for {position_id}"}
 
         # Record intent
         intent = OrderIntent(
@@ -395,9 +429,10 @@ async def execute_exit(
             reason=reason,
         )
         session.add(intent)
-        session.commit()
+        session.flush()
 
         broker = AlpacaBroker()
+        exit_limit_price = None
         if use_market:
             result = broker.submit_market_order(
                 symbol=pos.option_symbol,
@@ -408,12 +443,12 @@ async def execute_exit(
             exit_price = pos.current_price or pos.entry_price
             settings = get_settings()
             buffer = 1 - (settings.trading.limit_price_buffer_pct / 100)
-            limit_price = round(exit_price * buffer, 2)
+            exit_limit_price = round(exit_price * buffer, 2)
             result = broker.submit_limit_order(
                 symbol=pos.option_symbol,
                 side=OrderSide.SELL,
                 qty=pos.quantity,
-                limit_price=limit_price,
+                limit_price=exit_limit_price,
             )
 
         if not result.success:
@@ -424,6 +459,21 @@ async def execute_exit(
 
         intent.broker_order_id = result.broker_order_id
 
+        # Track exit order as BrokerOrder for reconciliation
+        exit_broker_order = BrokerOrder(
+            broker_order_id=result.broker_order_id,
+            intent_id=idemp_key,
+            ticker=pos.ticker,
+            option_symbol=pos.option_symbol,
+            side=OrderSide.SELL,
+            quantity=pos.quantity,
+            order_type="market" if use_market else "limit",
+            limit_price=exit_limit_price,
+            status=OrderStatus.SUBMITTED,
+        )
+        session.add(exit_broker_order)
+        session.flush()
+
         # Poll for fill
         fill_status = await _wait_for_fill(broker, result.broker_order_id)
         filled_qty = fill_status.get("filled_qty", 0)
@@ -433,6 +483,12 @@ async def execute_exit(
         if order_state == "filled" or filled_qty > 0:
             intent.status = IntentStatus.EXECUTED
             intent.executed_at = datetime.now(timezone.utc)
+
+            # Update exit broker order
+            exit_broker_order.status = OrderStatus.FILLED if order_state == "filled" else OrderStatus.PARTIAL
+            exit_broker_order.filled_qty = filled_qty
+            exit_broker_order.filled_price = filled_price
+            exit_broker_order.filled_at = datetime.now(timezone.utc)
 
             # Use actual fill price for P&L
             actual_exit_price = filled_price if filled_price else (pos.current_price or pos.entry_price)
@@ -465,18 +521,21 @@ async def execute_exit(
             session.add(trade)
             session.commit()
 
-            # Notify
-            notifier = TelegramNotifier()
-            await notifier.notify_exit(
-                ticker=pos.ticker,
-                action=pos.action.value if pos.action else "SELL",
-                quantity=pos.quantity,
-                entry_price=pos.entry_price,
-                exit_price=actual_exit_price,
-                pnl_pct=pnl_pct,
-                pnl_dollars=pnl_dollars,
-                reason=reason,
-            )
+            # Notify — isolated so failures don't affect the committed trade
+            try:
+                notifier = TelegramNotifier()
+                await notifier.notify_exit(
+                    ticker=pos.ticker,
+                    action=pos.action.value if pos.action else "SELL",
+                    quantity=pos.quantity,
+                    entry_price=pos.entry_price,
+                    exit_price=actual_exit_price,
+                    pnl_pct=pnl_pct,
+                    pnl_dollars=pnl_dollars,
+                    reason=reason,
+                )
+            except Exception as ne:
+                log.warning("notify_exit_failed", position_id=position_id, error=str(ne))
 
             log.info("exit_executed", position_id=position_id, ticker=pos.ticker, pnl=f"${pnl_dollars:.2f}", fill_price=actual_exit_price)
             return {
@@ -541,10 +600,13 @@ async def reconcile_orders() -> dict:
                 order.filled_price = filled_price
                 order.filled_at = datetime.now(timezone.utc)
 
-                # Update the corresponding position's entry price if it was created with limit price
-                _update_position_fill(session, order.intent_id, filled_price, filled_qty)
+                # Handle entry vs exit fills differently
+                if order.side == OrderSide.BUY:
+                    _update_position_fill(session, order.intent_id, filled_price, filled_qty)
+                else:
+                    _reconcile_exit_fill(session, order)
                 reconciled += 1
-                log.info("order_reconciled", order_id=order.broker_order_id, filled_price=filled_price)
+                log.info("order_reconciled", order_id=order.broker_order_id, side=order.side.value, filled_price=filled_price)
 
             elif order_state in ("cancelled", "canceled", "expired", "rejected"):
                 order.status = OrderStatus.CANCELLED
@@ -557,6 +619,13 @@ async def reconcile_orders() -> dict:
                 order.filled_qty = filled_qty
                 order.filled_price = filled_price
                 reconciled += 1
+                log.info(
+                    "order_partial_reconciled",
+                    order_id=order.broker_order_id,
+                    side=order.side.value,
+                    filled_qty=filled_qty,
+                    filled_price=filled_price,
+                )
 
         session.commit()
         log.info("reconcile_complete", pending=len(pending_orders), reconciled=reconciled)
@@ -570,7 +639,11 @@ async def reconcile_orders() -> dict:
 
 
 def _update_position_fill(session: object, intent_id: str, filled_price: float | None, filled_qty: int) -> None:
-    """Update position record with actual fill data."""
+    """Update or create position record with actual fill data.
+
+    If a position exists, updates entry price/qty with the actual fill.
+    If no position exists (order filled after poll timeout), creates one.
+    """
     if not filled_price:
         return
     intent = session.query(OrderIntent).filter(OrderIntent.idempotency_key == intent_id).first()
@@ -582,11 +655,110 @@ def _update_position_fill(session: object, intent_id: str, filled_price: float |
         .first()
     )
     if position:
+        old_price = position.entry_price
         position.entry_price = filled_price
         position.entry_value = filled_price * position.quantity * 100
         if filled_qty > 0:
             position.quantity = filled_qty
             position.entry_value = filled_price * filled_qty * 100
+        log.info(
+            "position_fill_updated",
+            position_id=position.position_id,
+            old_price=old_price,
+            new_price=filled_price,
+            filled_qty=filled_qty,
+        )
+    elif filled_qty > 0:
+        # Position doesn't exist yet (order filled after poll timeout).
+        # Create it now from the intent + fill data.
+        parsed = parse_occ_symbol(intent.option_symbol)
+        pos_action = SignalAction.CALL
+        pos_strike = 0.0
+        pos_expiration = ""
+        if parsed:
+            pos_action = SignalAction.CALL if parsed.option_type == "CALL" else SignalAction.PUT
+            pos_strike = parsed.strike
+            pos_expiration = parsed.expiration
+
+        new_position = PositionRecord(
+            position_id=uuid4().hex[:16],
+            signal_id=intent.signal_id,
+            ticker=intent.ticker,
+            option_symbol=intent.option_symbol,
+            action=pos_action,
+            strike=pos_strike,
+            expiration=pos_expiration,
+            quantity=filled_qty,
+            entry_price=filled_price,
+            entry_value=filled_price * filled_qty * 100,
+            status=PositionStatus.OPEN,
+            entry_thesis=intent.reason or "",
+        )
+        session.add(new_position)
+        intent.status = IntentStatus.EXECUTED
+        intent.executed_at = datetime.now(timezone.utc)
+        log.info(
+            "position_created_on_reconcile",
+            signal_id=intent.signal_id,
+            ticker=intent.ticker,
+            position_id=new_position.position_id,
+            filled_qty=filled_qty,
+            filled_price=filled_price,
+        )
+
+
+def _reconcile_exit_fill(session: object, order: BrokerOrder) -> None:
+    """Close position and create TradeLog for a reconciled exit fill."""
+    if not order.intent_id.startswith("exit-"):
+        return
+    position_id = order.intent_id[5:]  # Remove "exit-" prefix
+
+    intent = session.query(OrderIntent).filter(OrderIntent.idempotency_key == order.intent_id).first()
+    position = (
+        session.query(PositionRecord)
+        .filter(PositionRecord.position_id == position_id, PositionRecord.status == PositionStatus.OPEN)
+        .first()
+    )
+    if not position:
+        return
+
+    actual_exit_price = order.filled_price if order.filled_price else (position.current_price or position.entry_price)
+    position.status = PositionStatus.CLOSED
+    position.closed_at = datetime.now(timezone.utc)
+
+    pnl_dollars = (actual_exit_price - position.entry_price) * position.quantity * 100
+    pnl_pct = ((actual_exit_price - position.entry_price) / position.entry_price * 100) if position.entry_price else 0
+    hold_hours = 0.0
+    if position.opened_at:
+        hold_hours = (datetime.now(timezone.utc) - ensure_utc(position.opened_at)).total_seconds() / 3600
+
+    trade = TradeLog(
+        position_id=position_id,
+        ticker=position.ticker,
+        action=position.action,
+        entry_price=position.entry_price,
+        exit_price=actual_exit_price,
+        quantity=order.filled_qty if order.filled_qty else position.quantity,
+        pnl_dollars=round(pnl_dollars, 2),
+        pnl_pct=round(pnl_pct, 2),
+        hold_duration_hours=round(hold_hours, 1),
+        entry_thesis=position.entry_thesis,
+        exit_reason=intent.reason if intent else "reconciled_exit_fill",
+        opened_at=position.opened_at,
+    )
+    session.add(trade)
+
+    if intent:
+        intent.status = IntentStatus.EXECUTED
+        intent.executed_at = datetime.now(timezone.utc)
+
+    log.info(
+        "exit_reconciled",
+        position_id=position_id,
+        ticker=position.ticker,
+        pnl=f"${pnl_dollars:.2f}",
+        fill_price=actual_exit_price,
+    )
 
 
 def get_account_info() -> dict:
