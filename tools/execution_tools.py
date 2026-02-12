@@ -12,7 +12,7 @@ from uuid import uuid4
 from config.settings import get_settings
 from core.logger import get_logger
 from core.safety import get_safety_gate
-from core.utils import parse_occ_symbol
+from core.utils import ensure_utc, parse_occ_symbol
 from data.models import (
     BrokerOrder,
     IntentStatus,
@@ -446,7 +446,7 @@ async def execute_exit(
             pnl_pct = ((actual_exit_price - pos.entry_price) / pos.entry_price * 100) if pos.entry_price else 0
             hold_hours = 0.0
             if pos.opened_at:
-                hold_hours = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 3600
+                hold_hours = (datetime.now(timezone.utc) - ensure_utc(pos.opened_at)).total_seconds() / 3600
 
             trade = TradeLog(
                 position_id=position_id,
