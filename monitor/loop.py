@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytz
 
@@ -102,7 +102,7 @@ class MonitorLoop:
         self._kill_notified = False
 
         # Periodic health check (every 30 min)
-        now_utc = datetime.now(pytz.UTC)
+        now_utc = datetime.now(timezone.utc)
         if self._last_health_check is None or (now_utc - self._last_health_check).total_seconds() > 1800:
             try:
                 results = await self._health_checker.run_all()
@@ -202,7 +202,7 @@ class MonitorLoop:
             if self._should_refresh_greeks():
                 try:
                     refresh_result = refresh_positions()
-                    self._last_greeks_refresh = datetime.now(pytz.UTC)
+                    self._last_greeks_refresh = datetime.now(timezone.utc)
                     log.info("greeks_refreshed", cycle=self._cycle_count, result=refresh_result)
                 except Exception as e:
                     log.error("greeks_refresh_failed", error=str(e))
@@ -337,7 +337,7 @@ class MonitorLoop:
         """Check if enough time has passed to refresh Greeks."""
         if self._last_greeks_refresh is None:
             return True
-        elapsed = (datetime.now(pytz.UTC) - self._last_greeks_refresh).total_seconds()
+        elapsed = (datetime.now(timezone.utc) - self._last_greeks_refresh).total_seconds()
         return elapsed >= self.settings.monitor.greeks_snapshot_interval_seconds
 
     def _is_market_open(self) -> bool:
@@ -386,9 +386,9 @@ class MonitorLoop:
         session = get_session()
         try:
             from analytics.performance import get_performance_summary
-            from core.utils import trading_today_et
+            from core.utils import trading_today
 
-            today = trading_today_et()
+            today = trading_today()
 
             trades_today = (
                 session.query(TradeLog)

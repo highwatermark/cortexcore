@@ -439,11 +439,11 @@ class Orchestrator:
                 TradeLog,
                 get_session,
             )
-            from core.utils import trading_today_et
+            from core.utils import trading_today
 
             session = get_session()
             try:
-                today = trading_today_et()
+                today = trading_today()
                 trades_today = (
                     session.query(OrderIntent)
                     .filter(

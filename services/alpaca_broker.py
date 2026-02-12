@@ -211,8 +211,8 @@ class AlpacaBroker:
         """
         try:
             from alpaca.trading.requests import GetCalendarRequest
-            from core.utils import trading_today_et
-            today = trading_today_et()
+            from core.utils import trading_today
+            today = trading_today()
             cal_request = GetCalendarRequest(start=today, end=today)
             calendars = self._client.get_calendar(cal_request)
             if not calendars:
@@ -222,8 +222,8 @@ class AlpacaBroker:
         except Exception as e:
             log.warning("calendar_check_failed", error=str(e))
             # Fallback: assume open on weekdays (ET)
-            from core.utils import trading_now_et
-            return trading_now_et().weekday() < 5
+            from core.utils import trading_now
+            return trading_now().weekday() < 5
 
     @staticmethod
     def _extract_ticker(symbol: str) -> str:

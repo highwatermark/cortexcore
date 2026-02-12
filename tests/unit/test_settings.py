@@ -66,7 +66,7 @@ class TestSettings:
 
     def test_market_hours(self) -> None:
         settings = get_settings()
-        assert settings.market_hours.open_hour == 9
+        assert settings.market_hours.open_hour == 6
         assert settings.market_hours.open_minute == 30
-        assert settings.market_hours.close_hour == 16
-        assert settings.market_hours.timezone == "America/New_York"
+        assert settings.market_hours.close_hour == 13
+        assert settings.market_hours.timezone == "America/Los_Angeles"

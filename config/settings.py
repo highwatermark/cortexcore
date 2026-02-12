@@ -198,11 +198,11 @@ class MonitorConfig(BaseSettings):
 class MarketHours(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MARKET_", extra="ignore")
 
-    open_hour: int = Field(9, ge=0, le=23)
+    open_hour: int = Field(6, ge=0, le=23)
     open_minute: int = Field(30, ge=0, le=59)
-    close_hour: int = Field(16, ge=0, le=23)
+    close_hour: int = Field(13, ge=0, le=23)
     close_minute: int = Field(0, ge=0, le=59)
-    timezone: str = "America/New_York"
+    timezone: str = "America/Los_Angeles"
 
 
 class AgentModel(BaseSettings):

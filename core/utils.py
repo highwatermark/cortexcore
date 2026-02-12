@@ -9,23 +9,39 @@ from typing import NamedTuple
 
 import pytz
 
-# Eastern Time — the canonical timezone for US equity/options trading days.
-ET = pytz.timezone("America/New_York")
+# Pacific Time — the canonical timezone for all business logic (market hours,
+# day boundaries, DTE, display strings).  DB timestamps stay UTC.
+TZ = pytz.timezone("America/Los_Angeles")
 
 
-def trading_today_et() -> str:
-    """Return today's date string (YYYY-MM-DD) in Eastern Time.
+def trading_today() -> str:
+    """Return today's date string (YYYY-MM-DD) in Pacific Time.
 
     Use this for any day-boundary logic (daily counters, loss limits, calendar
-    checks).  UTC midnight != ET midnight, so using UTC causes counters to
-    reset at 7 PM ET (winter) / 8 PM ET (summer) instead of midnight.
+    checks).  UTC midnight != PT midnight, so using UTC causes counters to
+    reset at 4 PM PT (winter) / 5 PM PT (summer) instead of midnight.
     """
-    return datetime.now(ET).strftime("%Y-%m-%d")
+    return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
-def trading_now_et() -> datetime:
-    """Return current datetime in Eastern Time (timezone-aware)."""
-    return datetime.now(ET)
+def trading_now() -> datetime:
+    """Return current datetime in Pacific Time (timezone-aware)."""
+    return datetime.now(TZ)
+
+
+def ensure_utc(dt: datetime | None) -> datetime | None:
+    """Ensure a datetime is timezone-aware UTC.
+
+    SQLite strips tzinfo on read, so datetimes come back naive even
+    though they were stored as UTC.  This re-attaches UTC tzinfo when
+    needed, making subtraction/comparison with ``datetime.now(timezone.utc)``
+    safe.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 class OccSymbol(NamedTuple):
@@ -79,13 +95,13 @@ def parse_occ_symbol(symbol: str) -> OccSymbol | None:
 def calc_dte(expiration: str) -> int:
     """Calculate days to expiration from a YYYY-MM-DD date string.
 
-    Uses ET so that DTE doesn't flip a day early near UTC midnight.
+    Uses TZ so that DTE doesn't flip a day early near UTC midnight.
     """
     if not expiration:
         return 0
     try:
         exp_date = datetime.strptime(expiration, "%Y-%m-%d").date()
-        today = datetime.now(ET).date()
+        today = datetime.now(TZ).date()
         return max(0, (exp_date - today).days)
     except ValueError:
         return 0

@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from config.settings import get_settings
+from core.utils import calc_dte
 from core.logger import get_logger
 from data.models import (
     PositionRecord,
@@ -46,14 +47,8 @@ def get_open_positions() -> list[dict]:
             pnl_pct = ((current_price - pos.entry_price) / pos.entry_price * 100) if pos.entry_price else 0
             pnl_dollars = (current_price - pos.entry_price) * pos.quantity * 100  # options multiplier
 
-            # Calculate remaining DTE
-            dte_remaining = 0
-            if pos.expiration:
-                try:
-                    exp = datetime.strptime(pos.expiration, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                    dte_remaining = max(0, (exp - datetime.now(timezone.utc)).days)
-                except ValueError:
-                    pass
+            # Calculate remaining DTE (uses Pacific time via core.utils)
+            dte_remaining = calc_dte(pos.expiration) if pos.expiration else 0
 
             results.append({
                 "position_id": pos.position_id,

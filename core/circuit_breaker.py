@@ -15,6 +15,7 @@ from typing import NamedTuple
 
 from config.settings import get_settings
 from core.logger import get_logger
+from core.utils import ensure_utc
 from data.models import TradeLog, get_session
 
 log = get_logger("circuit_breaker")
@@ -54,9 +55,9 @@ class TradingCircuitBreaker:
         max_pct = self._settings.monitor.max_daily_loss_pct
         session = get_session()
         try:
-            from core.utils import trading_today_et, trading_now_et
-            today = trading_today_et()
-            now = trading_now_et()
+            from core.utils import trading_today, trading_now
+            today = trading_today()
+            now = trading_now()
             trades = (
                 session.query(TradeLog)
                 .filter(TradeLog.closed_at >= today)
@@ -67,7 +68,7 @@ class TradingCircuitBreaker:
 
             if loss_pct >= max_pct:
                 # Resumes next trading day (approximate: tomorrow 9:30 ET)
-                tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d 09:30 ET")
+                tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d 06:30 PT")
                 return BreakerState(
                     is_tripped=True,
                     reason=f"Daily loss {loss_pct:.1%} >= {max_pct:.0%} (${abs(total_loss):.0f})",
@@ -81,8 +82,8 @@ class TradingCircuitBreaker:
         max_pct = self._settings.monitor.max_weekly_loss_pct
         session = get_session()
         try:
-            from core.utils import trading_now_et
-            now = trading_now_et()
+            from core.utils import trading_now
+            now = trading_now()
             monday = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
             trades = (
                 session.query(TradeLog)
@@ -95,7 +96,7 @@ class TradingCircuitBreaker:
             if loss_pct >= max_pct:
                 # Resumes next Monday
                 days_to_monday = 7 - now.weekday()
-                next_monday = (now + timedelta(days=days_to_monday)).strftime("%Y-%m-%d 09:30 ET")
+                next_monday = (now + timedelta(days=days_to_monday)).strftime("%Y-%m-%d 06:30 PT")
                 return BreakerState(
                     is_tripped=True,
                     reason=f"Weekly loss {loss_pct:.1%} >= {max_pct:.0%} (${abs(total_loss):.0f})",
@@ -124,9 +125,7 @@ class TradingCircuitBreaker:
                 return BreakerState(is_tripped=False, reason="", resumes_at="")
 
             # Check if cooldown has passed since last loss
-            last_loss_time = recent[0].closed_at
-            if last_loss_time and last_loss_time.tzinfo is None:
-                last_loss_time = last_loss_time.replace(tzinfo=timezone.utc)
+            last_loss_time = ensure_utc(recent[0].closed_at)
 
             if last_loss_time:
                 resumes = last_loss_time + timedelta(minutes=cooldown)

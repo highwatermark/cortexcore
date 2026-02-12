@@ -8,9 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime, date, timezone
 
-import pytz
-
 from config.settings import get_settings
+from core.utils import TZ
 from core.logger import get_logger
 from data.models import FlowSignal, SignalAction, SignalRecord, get_session
 from services.unusual_whales import UnusualWhalesClient
@@ -41,13 +40,12 @@ async def scan_flow() -> list[dict]:
     """
     global _seen_date
 
-    # Reset seen set at the start of each trading day (ET)
-    et = pytz.timezone("America/New_York")
-    today_et = datetime.now(et).strftime("%Y-%m-%d")
-    if today_et != _seen_date:
+    # Reset seen set at the start of each trading day (PT)
+    today_tz = datetime.now(TZ).strftime("%Y-%m-%d")
+    if today_tz != _seen_date:
         _seen_contracts.clear()
-        _seen_date = today_et
-        log.info("seen_contracts_reset", date=today_et)
+        _seen_date = today_tz
+        log.info("seen_contracts_reset", date=today_tz)
 
     # Clear previous cycle's scored signals
     _scan_scored_signals.clear()
@@ -158,7 +156,7 @@ def score_signal(signal: dict) -> dict:
     if next_earnings:
         try:
             earnings_date = date.fromisoformat(next_earnings)
-            days_to_earnings = (earnings_date - date.today()).days
+            days_to_earnings = (earnings_date - datetime.now(TZ).date()).days
             if 0 <= days_to_earnings < 7:
                 score -= 2
                 breakdown.append(f"earnings_in_{days_to_earnings}d:-2")

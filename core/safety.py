@@ -137,8 +137,8 @@ class SafetyGate:
         max_exec = self._settings.trading.max_executions_per_day
         session = get_session()
         try:
-            from core.utils import trading_today_et
-            today = trading_today_et()
+            from core.utils import trading_today
+            today = trading_today()
             count = (
                 session.query(OrderIntent)
                 .filter(
@@ -158,8 +158,8 @@ class SafetyGate:
         max_loss_pct = self._settings.monitor.max_daily_loss_pct
         session = get_session()
         try:
-            from core.utils import trading_today_et
-            today = trading_today_et()
+            from core.utils import trading_today
+            today = trading_today()
             trades = (
                 session.query(TradeLog)
                 .filter(TradeLog.closed_at >= today)
@@ -185,8 +185,8 @@ class SafetyGate:
         session = get_session()
         try:
             # Monday of this week (ET)
-            from core.utils import trading_now_et
-            now = trading_now_et()
+            from core.utils import trading_now
+            now = trading_now()
             monday = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
             trades = (
                 session.query(TradeLog)
