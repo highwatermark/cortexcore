@@ -99,7 +99,9 @@ class TestSafetyGate:
         assert allowed is False
         assert "exposure" in reason.lower()
 
-    def test_max_position_value_blocked(self) -> None:
+    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_max_position_value_blocked(self, mock_timing, mock_broker) -> None:
         gate = SafetyGate()
         # 2 contracts * $6.00 * 100 = $1200 > $1000 limit
         allowed, reason = gate.check_entry(_base_signal(quantity=2, limit_price=6.00))
@@ -160,19 +162,25 @@ class TestSafetyGate:
         assert allowed is False
         assert "losses" in reason.lower()
 
-    def test_iv_rank_blocked(self) -> None:
+    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_iv_rank_blocked(self, mock_timing, mock_broker) -> None:
         gate = SafetyGate()
         allowed, reason = gate.check_entry(_base_signal(iv_rank=80))
         assert allowed is False
         assert "IV rank" in reason
 
-    def test_dte_blocked(self) -> None:
+    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_dte_blocked(self, mock_timing, mock_broker) -> None:
         gate = SafetyGate()
         allowed, reason = gate.check_entry(_base_signal(dte=7))
         assert allowed is False
         assert "DTE" in reason
 
-    def test_spread_blocked(self) -> None:
+    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_spread_blocked(self, mock_timing, mock_broker) -> None:
         gate = SafetyGate()
         # Spread = (5.00 - 4.00) / 5.00 = 20% > 15% limit
         allowed, reason = gate.check_entry(_base_signal(bid=4.00, ask=5.00))
@@ -195,34 +203,32 @@ class TestSafetyGate:
         if not allowed:
             assert "Spread" not in reason
 
-    @patch("core.safety._earnings_cache", {"AAPL": (
-        (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d"),
-        datetime.now(timezone.utc),
-    )})
-    def test_earnings_blackout_blocked(self) -> None:
+    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_earnings_blackout_blocked(self, mock_timing, mock_broker) -> None:
         gate = SafetyGate()
-        allowed, reason = gate.check_entry(_base_signal(ticker="AAPL"))
+        # Earnings tomorrow — within 2-day blackout
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+        allowed, reason = gate.check_entry(_base_signal(ticker="AAPL", next_earnings_date=tomorrow))
         assert allowed is False
         assert "Earnings blackout" in reason
 
-    @patch("core.safety._earnings_cache", {"AAPL": (
-        (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%d"),
-        datetime.now(timezone.utc),
-    )})
-    def test_earnings_far_away_allowed(self) -> None:
+    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_earnings_far_away_allowed(self, mock_timing, mock_broker) -> None:
         gate = SafetyGate()
         # Earnings 30 days away, well outside 2-day blackout
-        allowed, reason = gate.check_entry(_base_signal(ticker="AAPL"))
-        if not allowed:
-            assert "Earnings" not in reason
+        far_date = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%d")
+        allowed, reason = gate.check_entry(_base_signal(ticker="AAPL", next_earnings_date=far_date))
+        assert allowed is True
 
-    @patch("core.safety._earnings_cache", {"AAPL": (None, datetime.now(timezone.utc))})
-    def test_earnings_no_data_allowed(self) -> None:
+    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_earnings_no_data_allowed(self, mock_timing, mock_broker) -> None:
         gate = SafetyGate()
         # No earnings data — fail-open
         allowed, reason = gate.check_entry(_base_signal(ticker="AAPL"))
-        if not allowed:
-            assert "Earnings" not in reason
+        assert allowed is True
 
 
 class TestTradingCircuitBreaker:

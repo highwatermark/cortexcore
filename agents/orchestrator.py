@@ -34,24 +34,24 @@ RETRY_BASE_DELAY = 2  # seconds
 # ---------------------------------------------------------------------------
 
 DECISION_TOOLS = [
-    {
-        "name": "calculate_position_size",
-        "description": (
-            "Calculate the maximum number of contracts for a new position based on "
-            "current equity, existing exposure, and risk limits. Returns max_contracts "
-            "and the limiting factor. Call this BEFORE execute_entry."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "option_price": {
-                    "type": "number",
-                    "description": "The option premium per contract (e.g., 2.50 for $250/contract)",
-                },
-            },
-            "required": ["option_price"],
-        },
-    },
+    # {
+    #     "name": "calculate_position_size",
+    #     "description": (
+    #         "Calculate the maximum number of contracts for a new position based on "
+    #         "current equity, existing exposure, and risk limits. Returns max_contracts "
+    #         "and the limiting factor. Call this BEFORE execute_entry."
+    #     ),
+    #     "input_schema": {
+    #         "type": "object",
+    #         "properties": {
+    #             "option_price": {
+    #                 "type": "number",
+    #                 "description": "The option premium per contract (e.g., 2.50 for $250/contract)",
+    #             },
+    #         },
+    #         "required": ["option_price"],
+    #     },
+    # },
     {
         "name": "execute_entry",
         "description": (
@@ -114,14 +114,15 @@ You receive pre-computed data from a deterministic pipeline:
 - High-scoring flow signals (already scored 7+ out of 10 and passed pre-trade checks)
 - Current portfolio risk assessment
 - Open positions with P&L
-- Account equity
+- Account equity and position sizing constraints
 
 Your job is to decide for each signal: TRADE or SKIP.
 
 For TRADE signals:
-1. Call calculate_position_size with the estimated option price to get max contracts
-2. Call execute_entry with your conviction (0-100), a 1-2 sentence thesis, and quantity
-3. Be selective — skip marginal setups, there will always be another signal
+1. Use the SIZING CONSTRAINTS provided to calculate quantity yourself:
+   quantity = floor(min(per_trade_cap, position_value_cap, remaining_capacity) / (option_price * 100))
+   If quantity is 0, SKIP (option too expensive for current limits).
+2. Call execute_entry directly with your conviction (0-100), thesis, and quantity.
 
 RISK RULES (non-negotiable):
 - Never enter if risk_level is CRITICAL
@@ -340,15 +341,19 @@ class Orchestrator:
 
         market_text = self._format_market_context(market_context)
 
+        # Pre-fetch sizing constraints so Claude can compute quantity inline
+        sizing_text = self._get_sizing_context(positions)
+
         prompt = (
             f"SIGNALS THAT PASSED ALL CHECKS (score 7+ and pre-trade approved):\n"
             f"{''.join(s + chr(10) for s in signals_text)}\n"
             f"PORTFOLIO RISK:\n{risk_text}\n\n"
             f"OPEN POSITIONS:\n{positions_text}\n"
+            f"{sizing_text}\n"
             f"{perf_context}\n"
             f"{market_text}"
-            f"For each signal, decide TRADE or SKIP. For trades, call "
-            f"calculate_position_size first, then execute_entry with your thesis and conviction."
+            f"For each signal, decide TRADE or SKIP. For trades, compute quantity from "
+            f"the sizing constraints above and call execute_entry directly."
         )
 
         agent = self._make_agent(ENTRY_DECISION_SYSTEM)
@@ -421,11 +426,36 @@ class Orchestrator:
         spy_chg = market_context.get("spy_change_pct", 0)
         lines = ["MARKET CONTEXT:"]
         if vix is not None:
-            lines.append(f"  VIX (VIXY): {vix:.2f} ({vix_chg:+.1f}%) — {regime} regime")
+            lines.append(f"  VIX: {vix:.2f} ({vix_chg:+.1f}%) — {regime} regime")
         if spy is not None:
             lines.append(f"  SPY: ${spy:.2f} ({spy_chg:+.1f}%)")
         lines.append(f"  Regime note: {regime_notes.get(regime, 'Unknown regime')}")
         return "\n".join(lines) + "\n\n"
+
+    def _get_sizing_context(self, positions: list[dict]) -> str:
+        """Pre-compute position sizing constraints for Claude."""
+        trading = self._settings.trading
+        try:
+            from services.alpaca_broker import AlpacaBroker
+            account = AlpacaBroker().get_account()
+            equity = account.get("equity", 0)
+        except Exception:
+            return "SIZING CONSTRAINTS:\n  (equity unavailable — skip all trades)\n"
+
+        current_exposure = sum((p.get("entry_value", 0) or 0) for p in positions)
+        max_total = equity * trading.max_total_exposure_pct
+        remaining_capacity = max(0, max_total - current_exposure)
+        per_trade_cap = equity * trading.max_per_trade_pct
+
+        return (
+            f"SIZING CONSTRAINTS:\n"
+            f"  Equity: ${equity:,.0f}\n"
+            f"  Per-trade cap (20% equity): ${per_trade_cap:,.0f}\n"
+            f"  Position value cap: ${trading.max_position_value:,.0f}\n"
+            f"  Remaining exposure capacity: ${remaining_capacity:,.0f}\n"
+            f"  Formula: quantity = floor(min(per_trade_cap, position_value_cap, remaining_capacity) / (option_price × 100))\n"
+            f"  If quantity = 0, the option is too expensive — SKIP.\n"
+        )
 
     def get_performance_context(self) -> str:
         """Build performance context string for Claude prompts."""

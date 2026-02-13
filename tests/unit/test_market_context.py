@@ -19,7 +19,7 @@ class TestRegimeClassification:
         assert AlpacaOptionsData._classify_regime(12.0) == "LOW_VOL"
 
     def test_normal(self) -> None:
-        assert AlpacaOptionsData._classify_regime(14.0) == "NORMAL"
+        assert AlpacaOptionsData._classify_regime(15.0) == "NORMAL"
         assert AlpacaOptionsData._classify_regime(19.9) == "NORMAL"
 
     def test_elevated(self) -> None:
@@ -30,9 +30,9 @@ class TestRegimeClassification:
         assert AlpacaOptionsData._classify_regime(30.0) == "HIGH_VOL"
         assert AlpacaOptionsData._classify_regime(50.0) == "HIGH_VOL"
 
-    def test_boundary_14(self) -> None:
-        assert AlpacaOptionsData._classify_regime(13.99) == "LOW_VOL"
-        assert AlpacaOptionsData._classify_regime(14.0) == "NORMAL"
+    def test_boundary_15(self) -> None:
+        assert AlpacaOptionsData._classify_regime(14.99) == "LOW_VOL"
+        assert AlpacaOptionsData._classify_regime(15.0) == "NORMAL"
 
 
 class TestGetMarketContext:
@@ -41,18 +41,22 @@ class TestGetMarketContext:
     def test_normal_response(self, mock_opt_cls, mock_stock_cls) -> None:
         mock_stock_client = MagicMock()
         mock_stock_client.get_stock_snapshot.return_value = {
-            "VIXY": _mock_snapshot(18.50, 18.08),
             "SPY": _mock_snapshot(525.40, 529.64),
         }
         mock_stock_cls.return_value = mock_stock_client
 
-        client = AlpacaOptionsData()
-        result = client.get_market_context()
+        mock_yf_ticker = MagicMock()
+        mock_yf_ticker.fast_info = {"lastPrice": 17.51, "previousClose": 17.10}
 
-        assert result["vix_level"] == 18.50
+        with patch("services.alpaca_options_data.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_yf_ticker
+            client = AlpacaOptionsData()
+            result = client.get_market_context()
+
+        assert result["vix_level"] == 17.51
         assert result["spy_price"] == 525.40
         assert result["regime"] == "NORMAL"
-        assert abs(result["vix_change_pct"] - 2.32) < 0.1
+        assert abs(result["vix_change_pct"] - 2.40) < 0.1
         assert abs(result["spy_change_pct"] - (-0.80)) < 0.1
 
     @patch("services.alpaca_options_data.StockHistoricalDataClient")
@@ -60,13 +64,17 @@ class TestGetMarketContext:
     def test_high_vol_regime(self, mock_opt_cls, mock_stock_cls) -> None:
         mock_stock_client = MagicMock()
         mock_stock_client.get_stock_snapshot.return_value = {
-            "VIXY": _mock_snapshot(35.0, 30.0),
             "SPY": _mock_snapshot(480.0, 500.0),
         }
         mock_stock_cls.return_value = mock_stock_client
 
-        client = AlpacaOptionsData()
-        result = client.get_market_context()
+        mock_yf_ticker = MagicMock()
+        mock_yf_ticker.fast_info = {"lastPrice": 35.0, "previousClose": 30.0}
+
+        with patch("services.alpaca_options_data.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_yf_ticker
+            client = AlpacaOptionsData()
+            result = client.get_market_context()
 
         assert result["regime"] == "HIGH_VOL"
         assert result["vix_level"] == 35.0
@@ -78,22 +86,27 @@ class TestGetMarketContext:
         mock_stock_client.get_stock_snapshot.side_effect = Exception("API down")
         mock_stock_cls.return_value = mock_stock_client
 
-        client = AlpacaOptionsData()
-        result = client.get_market_context()
+        with patch("services.alpaca_options_data.yf") as mock_yf:
+            mock_yf.Ticker.side_effect = Exception("yfinance down")
+            client = AlpacaOptionsData()
+            result = client.get_market_context()
 
         assert result == {}
 
     @patch("services.alpaca_options_data.StockHistoricalDataClient")
     @patch("services.alpaca_options_data.OptionHistoricalDataClient")
-    def test_partial_data_vixy_only(self, mock_opt_cls, mock_stock_cls) -> None:
+    def test_vix_only_no_spy(self, mock_opt_cls, mock_stock_cls) -> None:
         mock_stock_client = MagicMock()
-        mock_stock_client.get_stock_snapshot.return_value = {
-            "VIXY": _mock_snapshot(22.0, 20.0),
-        }
+        mock_stock_client.get_stock_snapshot.return_value = {}
         mock_stock_cls.return_value = mock_stock_client
 
-        client = AlpacaOptionsData()
-        result = client.get_market_context()
+        mock_yf_ticker = MagicMock()
+        mock_yf_ticker.fast_info = {"lastPrice": 22.0, "previousClose": 20.0}
+
+        with patch("services.alpaca_options_data.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_yf_ticker
+            client = AlpacaOptionsData()
+            result = client.get_market_context()
 
         assert result["vix_level"] == 22.0
         assert result["regime"] == "ELEVATED"
@@ -104,13 +117,17 @@ class TestGetMarketContext:
     def test_zero_prev_close_no_division_error(self, mock_opt_cls, mock_stock_cls) -> None:
         mock_stock_client = MagicMock()
         mock_stock_client.get_stock_snapshot.return_value = {
-            "VIXY": _mock_snapshot(18.0, 0.0),
-            "SPY": _mock_snapshot(525.0, 525.0),
+            "SPY": _mock_snapshot(525.0, 0.0),
         }
         mock_stock_cls.return_value = mock_stock_client
 
-        client = AlpacaOptionsData()
-        result = client.get_market_context()
+        mock_yf_ticker = MagicMock()
+        mock_yf_ticker.fast_info = {"lastPrice": 18.0, "previousClose": 0.0}
+
+        with patch("services.alpaca_options_data.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_yf_ticker
+            client = AlpacaOptionsData()
+            result = client.get_market_context()
 
         assert result["vix_change_pct"] == 0.0
         assert result["spy_change_pct"] == 0.0
@@ -135,7 +152,8 @@ class TestFormatMarketContext:
             "regime": "NORMAL",
         }
         result = Orchestrator._format_market_context(ctx)
-        assert "VIXY" in result
+        assert "VIX" in result
+        assert "VIXY" not in result
         assert "NORMAL regime" in result
         assert "SPY" in result
         assert "$525.40" in result

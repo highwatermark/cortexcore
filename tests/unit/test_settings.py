@@ -35,7 +35,7 @@ class TestSettings:
         assert settings.monitor.max_daily_loss_pct == 0.05
         assert settings.monitor.max_weekly_loss_pct == 0.10
         assert settings.monitor.loss_cooldown_minutes == 120
-        assert settings.monitor.market_open_delay_minutes == 15
+        assert settings.monitor.market_open_delay_minutes == 0
         assert settings.monitor.market_close_buffer_minutes == 15
         assert settings.monitor.circuit_breaker_cooldown_seconds == 7200
 

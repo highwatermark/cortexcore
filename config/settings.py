@@ -91,7 +91,7 @@ class FlowScan(BaseSettings):
     min_dte: int = Field(14, ge=0)
     max_dte: int = Field(45, ge=1)
     issue_types: list[str] = Field(default_factory=lambda: ["Common Stock"])
-    scan_limit: int = Field(30, ge=1, le=200)
+    scan_limit: int = Field(100, ge=1, le=200)
 
     # Post-filter
     min_score: int = Field(7, ge=0, le=10)
@@ -191,7 +191,7 @@ class MonitorConfig(BaseSettings):
     loss_cooldown_minutes: int = Field(120, ge=1)
 
     # Market timing safety
-    market_open_delay_minutes: int = Field(15, ge=0)
+    market_open_delay_minutes: int = Field(0, ge=0)
     market_close_buffer_minutes: int = Field(15, ge=0)
 
 

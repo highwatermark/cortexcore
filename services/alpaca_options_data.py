@@ -5,6 +5,7 @@ Wraps alpaca-py OptionHistoricalDataClient for snapshot queries.
 """
 from __future__ import annotations
 
+import yfinance as yf
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import OptionSnapshotRequest, StockSnapshotRequest
@@ -93,40 +94,53 @@ class AlpacaOptionsData:
         return results
 
     def get_market_context(self) -> dict:
-        """Fetch VIX (via VIXY) and SPY market context for Claude decisions.
+        """Fetch VIX index and SPY market context for Claude decisions.
+
+        VIX is fetched via yfinance (^VIX) since Alpaca doesn't serve
+        index data.  SPY is still fetched from Alpaca.
 
         Returns {
-            "vix_level": float,      # VIXY price as VIX proxy
-            "vix_change_pct": float,  # daily change %
+            "vix_level": float,       # actual VIX index level
+            "vix_change_pct": float,   # daily change %
             "spy_price": float,
-            "spy_change_pct": float,  # daily change %
-            "regime": str,            # LOW_VOL / NORMAL / ELEVATED / HIGH_VOL
+            "spy_change_pct": float,   # daily change %
+            "regime": str,             # LOW_VOL / NORMAL / ELEVATED / HIGH_VOL
         }
         """
-        client = self._get_stock_client()
-        try:
-            request = StockSnapshotRequest(symbol_or_symbols=["VIXY", "SPY"])
-            snapshots = client.get_stock_snapshot(request)
-        except Exception as e:
-            log.error("market_context_fetch_failed", error=str(e))
-            return {}
-
         result: dict = {}
-        for symbol in ("VIXY", "SPY"):
-            snap = snapshots.get(symbol)
-            if snap is None:
-                continue
-            price = snap.daily_bar.close if snap.daily_bar else None
-            prev_close = snap.previous_daily_bar.close if snap.previous_daily_bar else None
-            change_pct = 0.0
-            if price and prev_close and prev_close > 0:
-                change_pct = round((price - prev_close) / prev_close * 100, 2)
-            if symbol == "VIXY":
-                result["vix_level"] = price
-                result["vix_change_pct"] = change_pct
-            else:
-                result["spy_price"] = price
-                result["spy_change_pct"] = change_pct
+
+        # --- VIX via yfinance (actual CBOE VIX index) ---
+        try:
+            vix_ticker = yf.Ticker("^VIX")
+            fi = vix_ticker.fast_info
+            vix_price = fi.get("lastPrice") or fi.get("last_price")
+            vix_prev = fi.get("previousClose") or fi.get("previous_close")
+            if vix_price and vix_price > 0:
+                result["vix_level"] = round(vix_price, 2)
+                if vix_prev and vix_prev > 0:
+                    result["vix_change_pct"] = round((vix_price - vix_prev) / vix_prev * 100, 2)
+                else:
+                    result["vix_change_pct"] = 0.0
+        except Exception as e:
+            log.error("vix_fetch_failed", error=str(e))
+
+        # --- SPY via Alpaca ---
+        try:
+            client = self._get_stock_client()
+            request = StockSnapshotRequest(symbol_or_symbols=["SPY"])
+            snapshots = client.get_stock_snapshot(request)
+            snap = snapshots.get("SPY")
+            if snap:
+                price = snap.daily_bar.close if snap.daily_bar else None
+                prev_close = snap.previous_daily_bar.close if snap.previous_daily_bar else None
+                if price:
+                    result["spy_price"] = price
+                    if prev_close and prev_close > 0:
+                        result["spy_change_pct"] = round((price - prev_close) / prev_close * 100, 2)
+                    else:
+                        result["spy_change_pct"] = 0.0
+        except Exception as e:
+            log.error("spy_fetch_failed", error=str(e))
 
         if "vix_level" in result:
             result["regime"] = self._classify_regime(result["vix_level"])
@@ -135,12 +149,13 @@ class AlpacaOptionsData:
         return result
 
     @staticmethod
-    def _classify_regime(vixy_price: float) -> str:
-        if vixy_price < 14:
+    def _classify_regime(vix_level: float) -> str:
+        """Classify volatility regime based on actual VIX index level."""
+        if vix_level < 15:
             return "LOW_VOL"
-        elif vixy_price < 20:
+        elif vix_level < 20:
             return "NORMAL"
-        elif vixy_price < 30:
+        elif vix_level < 30:
             return "ELEVATED"
         else:
             return "HIGH_VOL"

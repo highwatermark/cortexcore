@@ -85,16 +85,19 @@ class HealthChecker:
         """Verify database is accessible and tables exist."""
         import time
         start = time.monotonic()
+        session = None
         try:
             from data.models import get_session, PositionRecord
             session = get_session()
             session.query(PositionRecord).limit(1).all()
-            session.close()
             ms = (time.monotonic() - start) * 1000
             return HealthResult("database", True, "OK", ms)
         except Exception as e:
             ms = (time.monotonic() - start) * 1000
             return HealthResult("database", False, str(e)[:100], ms)
+        finally:
+            if session is not None:
+                session.close()
 
     def _check_disk_space(self) -> HealthResult:
         """Verify sufficient disk space."""
