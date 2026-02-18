@@ -155,12 +155,17 @@ def score_signal(signal: dict) -> dict:
         breakdown.append(f"iv_rank>{70}:-3")
 
     dte = signal.get("dte", 0)
-    if dte < 7:
+    if dte < 6:
         score -= 2
-        breakdown.append("dte<7:-2")
+        breakdown.append("dte<6:-2")
     elif dte < 14:
         score -= 1
         breakdown.append("dte<14:-1")
+
+    # Skip non-calls (safety check — API should filter, but double-check)
+    if signal.get("option_type", "").upper() not in ("CALL", ""):
+        score = 0
+        breakdown.append("non_call:blocked")
 
     # Near earnings penalty
     next_earnings = signal.get("next_earnings_date", "")

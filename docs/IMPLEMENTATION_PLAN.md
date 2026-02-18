@@ -79,7 +79,7 @@ Before any code changes, these are the authoritative values. Any deviation is a 
     6. `max_weekly_loss_pct` not exceeded (query TradeLog for this week's realized losses)
     7. `max_consecutive_losses` not exceeded (query TradeLog for recent consecutive losses)
     8. `max_iv_rank_for_entry` (70%) enforced
-    9. `min_dte_for_entry` (14) enforced
+    9. `min_dte_for_entry` (6) enforced
     10. `max_spread_pct` (15%) enforced
     11. `earnings_blackout_days` (2) enforced — check via UW earnings endpoint or Alpaca
     12. `market_open_delay_minutes` (15) enforced — block entries in first 15 min

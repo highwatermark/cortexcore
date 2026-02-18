@@ -81,12 +81,20 @@ class UnusualWhalesClient:
         # Additional API-level filters
         if self._flow_cfg.min_dte > 0:
             params["min_dte"] = self._flow_cfg.min_dte
-        if self._flow_cfg.max_dte > 0:
+        if self._flow_cfg.max_dte is not None and self._flow_cfg.max_dte > 0:
             params["max_dte"] = self._flow_cfg.max_dte
         if self._flow_cfg.all_opening:
             params["all_opening"] = "true"
         if self._flow_cfg.min_vol_oi_ratio > 0:
             params["min_volume_oi_ratio"] = str(self._flow_cfg.min_vol_oi_ratio)
+
+        # Calls-only, ASK-side-only filters
+        if self._flow_cfg.is_call:
+            params["is_call"] = "true"
+        if self._flow_cfg.is_put is False:
+            params["is_put"] = "false"
+        if self._flow_cfg.is_ask_side:
+            params["is_ask_side"] = "true"
 
         log.debug("uw_api_query", params=params)
 
@@ -277,7 +285,8 @@ class UnusualWhalesClient:
 
         # DTE check
         dte = calc_dte(expiration)
-        if dte < self._flow_cfg.min_dte or dte > self._flow_cfg.max_dte:
+        max_dte = self._flow_cfg.max_dte
+        if dte < self._flow_cfg.min_dte or (max_dte is not None and dte > max_dte):
             log.debug("filter_drop", ticker=ticker, reason="dte_out_of_range", dte=dte)
             return None, "dte_out_of_range"
 

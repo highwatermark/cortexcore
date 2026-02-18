@@ -58,8 +58,8 @@ class TradingLimits(BaseSettings):
     max_premium_per_contract: float = Field(500.0, gt=0)
 
     # DTE
-    min_dte: int = Field(14, ge=0)
-    max_dte: int = Field(45, ge=1)
+    min_dte: int = Field(6, ge=0)
+    max_dte: int | None = Field(None)
 
     # Liquidity
     max_spread_pct: float = Field(15.0, gt=0, le=100.0)
@@ -74,12 +74,6 @@ class TradingLimits(BaseSettings):
     use_limit_orders: bool = True
     limit_price_buffer_pct: float = Field(5.0, ge=0, le=50.0)
 
-    @model_validator(mode="after")
-    def dte_order(self) -> "TradingLimits":
-        if self.min_dte >= self.max_dte:
-            raise ValueError(f"min_dte ({self.min_dte}) must be < max_dte ({self.max_dte})")
-        return self
-
 
 class FlowScan(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FLOW_", extra="ignore")
@@ -88,8 +82,11 @@ class FlowScan(BaseSettings):
     min_premium: int = Field(100_000, ge=0)
     min_vol_oi_ratio: float = Field(1.5, ge=0)
     all_opening: bool = True
-    min_dte: int = Field(14, ge=0)
-    max_dte: int = Field(45, ge=1)
+    min_dte: int = Field(6, ge=0)
+    max_dte: int | None = Field(None)
+    is_call: bool = True
+    is_put: bool = False
+    is_ask_side: bool = True
     issue_types: list[str] = Field(default_factory=lambda: ["Common Stock"])
     scan_limit: int = Field(100, ge=1, le=200)
 
@@ -125,7 +122,7 @@ class RiskFramework(BaseSettings):
     min_risk_capacity_pct: float = Field(0.20, ge=0, le=1.0)
     max_iv_rank_for_entry: int = Field(70, ge=0, le=100)
     require_trend_alignment: bool = True
-    min_dte_for_entry: int = Field(14, ge=0)
+    min_dte_for_entry: int = Field(6, ge=0)
     max_premium_per_contract: float = Field(500.0, gt=0)
 
     # Exit triggers

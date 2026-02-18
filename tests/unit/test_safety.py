@@ -174,7 +174,7 @@ class TestSafetyGate:
     @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
     def test_dte_blocked(self, mock_timing, mock_broker) -> None:
         gate = SafetyGate()
-        allowed, reason = gate.check_entry(_base_signal(dte=7))
+        allowed, reason = gate.check_entry(_base_signal(dte=3))
         assert allowed is False
         assert "DTE" in reason
 

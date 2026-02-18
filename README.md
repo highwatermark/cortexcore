@@ -1,6 +1,6 @@
 # Momentum Agent v2
 
-AI-native options flow trading system powered by the Anthropic Claude Agent SDK. Monitors institutional options flow via the Unusual Whales API, scores signals using deterministic rules, and executes trades through Alpaca with a multi-layered safety architecture.
+AI-native options flow trading system powered by the Anthropic Claude Agent SDK. Monitors institutional options flow via the Unusual Whales API, scores signals using deterministic rules, and executes trades through Alpaca with a multi-layered safety architecture. Trades **calls only, ASK-side only** — following institutional buyers with no directional interpretation needed.
 
 ## Architecture
 
@@ -12,7 +12,8 @@ Orchestrator (Claude Sonnet 4 - lead agent)
     |
     +-- Flow Scanner ------> Unusual Whales API (/option-trades/flow-alerts)
     |                           - newer_than high-watermark (only new alerts)
-    |                           - min_premium, DTE, vol/OI, opening filters
+    |                           - Calls only, ASK-side only, opening positions
+    |                           - min_premium, DTE, vol/OI filters
     |
     +-- Position Manager ---> SQLite DB (positions, P&L, Greeks)
     |
@@ -157,16 +158,19 @@ Signals from Unusual Whales are scored on a 0-10 scale. Minimum to pass: **7**.
 | Indicator              | Points |
 |------------------------|--------|
 | IV rank > 70%          | -3     |
-| DTE < 7                | -2     |
-| DTE 7-14               | -1     |
+| DTE < 6                | -2     |
+| DTE 6-14               | -1     |
 | Earnings within 7 days | -2     |
+| Non-CALL option        | blocked|
 
 ### API-Level Filters (applied before scoring)
 
+- `is_call`: true, `is_put`: false (calls only)
+- `is_ask_side`: true (institutional buyers only)
+- `all_opening`: true (opening positions only)
 - `min_premium`: $100,000
 - `min_volume_oi_ratio`: 1.5
-- `all_opening`: true (opening positions only)
-- `min_dte`: 14, `max_dte`: 45
+- `min_dte`: 6 (no upper limit — LEAPs allowed)
 - `issue_types`: Common Stock (excludes ETFs)
 - `newer_than`: Unix timestamp of last scan (high-watermark)
 
@@ -185,7 +189,7 @@ Signals from Unusual Whales are scored on a 0-10 scale. Minimum to pass: **7**.
 7. Weekly loss limit (10% of equity)
 8. Consecutive loss limit (2)
 9. IV rank cap (70%)
-10. Minimum DTE (14)
+10. Minimum DTE (6)
 11. Max bid-ask spread (15%)
 12. Earnings blackout (2 days)
 13. Market timing (15 min buffer at open/close)

@@ -83,10 +83,10 @@ class TestScoreSignal:
             "vol_oi_ratio": 1.0,
             "premium": 100000,
             "iv_rank": 30,
-            "dte": 5,
+            "dte": 4,
         }
         result = score_signal(signal)
-        assert "dte<7:-2" in result["breakdown"]
+        assert "dte<6:-2" in result["breakdown"]
 
     def test_high_score_passes(self) -> None:
         signal = {

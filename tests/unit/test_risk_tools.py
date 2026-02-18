@@ -89,7 +89,7 @@ class TestPreTradeCheck:
             "signal_id": "sig-5",
             "ticker": "GOOG",
             "iv_rank": 30,
-            "dte": 7,
+            "dte": 3,
             "open_interest": 1000,
             "score": 8,
         }
