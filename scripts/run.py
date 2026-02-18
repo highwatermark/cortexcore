@@ -21,7 +21,6 @@ from config.settings import get_settings
 from core.logger import get_logger, setup_logging
 from data.models import init_db
 from monitor.loop import MonitorLoop
-from agents.orchestrator import Orchestrator
 
 
 def bootstrap() -> None:
@@ -52,24 +51,120 @@ async def run_loop() -> None:
 
 
 async def run_once() -> None:
-    """Run a single scan cycle."""
+    """Run a single scan cycle using the same pipeline as the monitor loop."""
+    from agents.orchestrator import Orchestrator
+    from tools.flow_tools import scan_flow, score_signal, save_signal, send_scan_report
+    from tools.position_tools import get_open_positions, check_exit_triggers
+    from tools.risk_tools import calculate_portfolio_risk, pre_trade_check
+
     log = get_logger("run_once")
     orchestrator = Orchestrator()
     log.info("running_single_cycle")
-    result = await orchestrator.run_scan_cycle()
-    print("\n--- Scan Cycle Result ---")
-    print(result)
+
+    # Step 1: Scan flow
+    signals = await scan_flow()
+    print(f"\n--- Scan Cycle Result ---")
+    print(f"Signals fetched: {len(signals)}")
+
+    # Step 2: Score each signal
+    scored: list[tuple[dict, dict]] = []
+    for sig in signals:
+        result = score_signal(sig)
+        save_signal(sig, result)
+        scored.append((sig, result))
+        status = "PASS" if result["passed"] else "FAIL"
+        print(f"  [{status}] {sig.get('ticker', '?')} {sig.get('option_type', '?')} "
+              f"${sig.get('strike', 0):.0f} DTE={sig.get('dte', 0)} "
+              f"Score={result['score']}/10 — {result['breakdown']}")
+
+    # Step 3: Send Telegram scan report
+    if scored:
+        try:
+            await send_scan_report()
+        except Exception as e:
+            log.warning("scan_report_failed", error=str(e))
+
+    # Step 4: Portfolio risk
+    risk_assessment = calculate_portfolio_risk()
+    print(f"\nRisk: {risk_assessment.get('risk_score', 0)}/100 "
+          f"({risk_assessment.get('risk_level', 'UNKNOWN')})")
+
+    # Step 5: Open positions & exit triggers
+    positions = get_open_positions()
+    print(f"Open positions: {len(positions)}")
+    triggered: list[tuple[dict, dict]] = []
+    for pos in positions:
+        trigger_result = check_exit_triggers(pos)
+        if trigger_result.get("should_exit"):
+            triggered.append((pos, trigger_result))
+            print(f"  EXIT TRIGGER: {pos['ticker']} — {', '.join(trigger_result.get('triggers', []))}")
+
+    # Step 6: Filter passing signals + pre-trade checks
+    passing: list[tuple[dict, dict, dict]] = []
+    for sig, score_result in scored:
+        if not score_result.get("passed"):
+            continue
+        ptc = pre_trade_check({**sig, "score": score_result.get("score", 0)}, risk_assessment)
+        if ptc.get("approved"):
+            passing.append((sig, score_result, ptc))
+        else:
+            print(f"  Pre-trade DENIED: {sig.get('ticker', '?')} — {', '.join(ptc.get('reasons', []))}")
+
+    # Step 7: Claude entry decisions (if any signals pass)
+    if passing:
+        print(f"\n{len(passing)} signal(s) passed all checks — calling Claude for entry decision...")
+        perf_context = orchestrator.get_performance_context()
+        try:
+            entry_result = await orchestrator.evaluate_entries(
+                passing_signals=passing,
+                risk_assessment=risk_assessment,
+                positions=positions,
+                perf_context=perf_context,
+            )
+            print(f"\nClaude entry decision:\n{entry_result}")
+        except Exception as e:
+            print(f"\nEntry evaluation failed: {e}")
+    else:
+        print(f"\nNo signals passed all checks — no Claude API call needed.")
+
+    # Step 8: Claude exit decisions (if any triggers)
+    if triggered:
+        print(f"\n{len(triggered)} position(s) triggered exit — calling Claude...")
+        try:
+            exit_result = await orchestrator.evaluate_exits(
+                triggered_positions=triggered,
+                risk_assessment=risk_assessment,
+            )
+            print(f"\nClaude exit decision:\n{exit_result}")
+        except Exception as e:
+            print(f"\nExit evaluation failed: {e}")
+
     print("--- End ---\n")
 
 
 async def run_risk() -> None:
-    """Run a risk assessment."""
+    """Run a risk assessment only."""
+    from tools.risk_tools import calculate_portfolio_risk
+    from tools.position_tools import get_open_positions
+
     log = get_logger("run_risk")
-    orchestrator = Orchestrator()
     log.info("running_risk_check")
-    result = await orchestrator.run_risk_check()
+
+    risk = calculate_portfolio_risk()
+    positions = get_open_positions()
+
     print("\n--- Risk Assessment ---")
-    print(result)
+    print(f"Risk score: {risk.get('risk_score', 0)}/100 ({risk.get('risk_level', 'UNKNOWN')})")
+    print(f"Position count: {risk.get('position_count', 0)}")
+    print(f"Risk capacity: {risk.get('risk_capacity_pct', 0):.0%}")
+    print(f"Delta exposure: {risk.get('delta_exposure', 0)}")
+    print(f"Theta daily: {risk.get('theta_daily_pct', 0):.3%}")
+    if risk.get("warnings"):
+        print(f"Warnings: {', '.join(risk['warnings'])}")
+    print(f"\nOpen positions: {len(positions)}")
+    for p in positions:
+        print(f"  {p['ticker']} {p.get('action', '?')} ${p.get('strike', 0):.0f} "
+              f"DTE={p.get('dte_remaining', 0)} P&L={p.get('pnl_pct', 0):+.1f}%")
     print("--- End ---\n")
 
 
