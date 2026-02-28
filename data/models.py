@@ -217,6 +217,7 @@ class FlowSignal(BaseModel):
     open_interest: int
     vol_oi_ratio: float
     option_type: str
+    option_symbol: str = ""
     order_type: str = ""
     underlying_price: float = 0.0
     iv_rank: float = 0.0

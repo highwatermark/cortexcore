@@ -12,7 +12,7 @@ from uuid import uuid4
 from config.settings import get_settings
 from core.logger import get_logger
 from core.safety import get_safety_gate
-from core.utils import ensure_utc, parse_occ_symbol
+from core.utils import calc_dte, ensure_utc, parse_occ_symbol
 from data.models import (
     BrokerOrder,
     IntentStatus,
@@ -186,6 +186,26 @@ async def execute_entry(
     })
     if not allowed:
         return {"success": False, "error": f"Safety gate blocked: {reason}"}
+
+    # Clamp limit price to live ask + 5% to prevent overpaying
+    try:
+        from services.alpaca_options_data import get_options_data_client
+        snapshots = get_options_data_client().get_snapshots([option_symbol])
+        snap = snapshots.get(option_symbol)
+        if snap and snap.get("current_price"):
+            live_price = snap["current_price"]
+            max_limit = round(live_price * 1.05, 2)
+            if limit_price > max_limit:
+                log.warning("limit_price_clamped",
+                    ticker=ticker,
+                    proposed=limit_price,
+                    live_price=live_price,
+                    clamped_to=max_limit)
+                limit_price = max_limit
+        else:
+            log.warning("no_live_quote_for_entry", symbol=option_symbol)
+    except Exception as e:
+        log.warning("entry_quote_fetch_failed", symbol=option_symbol, error=str(e))
 
     session = get_session()
     try:
@@ -413,8 +433,21 @@ async def execute_exit(
                 # Previous attempt failed — remove so we can retry
                 session.delete(existing)
                 session.flush()
+            elif existing.status == IntentStatus.PENDING:
+                # Check staleness — if PENDING for >4 hours, reset to FAILED and allow retry
+                if existing.created_at:
+                    age_seconds = (datetime.now(timezone.utc) - existing.created_at).total_seconds()
+                    if age_seconds > 14400:  # 4 hours
+                        log.warning("stale_intent_reset",
+                            intent_key=existing.idempotency_key,
+                            age_hours=round(age_seconds / 3600, 1))
+                        session.delete(existing)
+                        session.flush()
+                    else:
+                        return {"success": False, "error": f"Exit already pending for {position_id}"}
+                else:
+                    return {"success": False, "error": f"Exit already pending for {position_id}"}
             else:
-                # PENDING — exit order may still be in flight
                 return {"success": False, "error": f"Exit already {existing.status.value.lower()} for {position_id}"}
 
         # Record intent
@@ -433,7 +466,25 @@ async def execute_exit(
 
         broker = AlpacaBroker()
         exit_limit_price = None
-        if use_market:
+
+        # Auto-market for near-worthless, deep-loss, or near-expiry positions
+        should_use_market = use_market
+        if not should_use_market:
+            current_price = pos.current_price or pos.entry_price
+            pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) if pos.entry_price else 0
+            dte = calc_dte(pos.expiration) if pos.expiration else 999
+
+            if current_price is not None and current_price < 0.10:
+                should_use_market = True
+                log.info("auto_market_order", reason="near_worthless", price=current_price)
+            elif pnl_pct <= -0.50:
+                should_use_market = True
+                log.info("auto_market_order", reason="deep_loss", pnl_pct=round(pnl_pct, 3))
+            elif dte <= 3:
+                should_use_market = True
+                log.info("auto_market_order", reason="near_expiry", dte=dte)
+
+        if should_use_market:
             result = broker.submit_market_order(
                 symbol=pos.option_symbol,
                 side=OrderSide.SELL,
@@ -467,7 +518,7 @@ async def execute_exit(
             option_symbol=pos.option_symbol,
             side=OrderSide.SELL,
             quantity=pos.quantity,
-            order_type="market" if use_market else "limit",
+            order_type="market" if should_use_market else "limit",
             limit_price=exit_limit_price,
             status=OrderStatus.SUBMITTED,
         )
@@ -578,7 +629,7 @@ async def reconcile_orders() -> dict:
     try:
         pending_orders = (
             session.query(BrokerOrder)
-            .filter(BrokerOrder.status.in_([OrderStatus.SUBMITTED, OrderStatus.PENDING]))
+            .filter(BrokerOrder.status.in_([OrderStatus.SUBMITTED, OrderStatus.PENDING, OrderStatus.PARTIAL]))
             .all()
         )
 
@@ -613,6 +664,19 @@ async def reconcile_orders() -> dict:
                 order.error_msg = f"Order {order_state}"
                 reconciled += 1
                 log.info("order_cancelled_reconciled", order_id=order.broker_order_id, state=order_state)
+
+                # Reset the associated OrderIntent so execute_exit() can retry
+                if order.intent_id:
+                    intent = session.query(OrderIntent).filter(
+                        OrderIntent.idempotency_key == order.intent_id
+                    ).first()
+                    if intent and intent.status == IntentStatus.PENDING:
+                        intent.status = IntentStatus.FAILED
+                        intent.reason = f"Broker order {order_state} — eligible for retry"
+                        log.warning("intent_reset_for_retry",
+                            intent_key=order.intent_id,
+                            broker_order_id=str(order.broker_order_id),
+                            order_state=order_state)
 
             elif filled_qty > 0:
                 order.status = OrderStatus.PARTIAL

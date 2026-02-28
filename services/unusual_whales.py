@@ -189,6 +189,25 @@ class UnusualWhalesClient:
 
         if drop_reasons:
             log.info("uw_filter_drops", drops=drop_reasons)
+
+        # Batch-enrich IV from Alpaca options snapshots
+        if signals:
+            try:
+                from services.alpaca_options_data import get_options_data_client
+                occ_symbols = [s.option_symbol for s in signals if s.option_symbol]
+                if occ_symbols:
+                    snapshots = get_options_data_client().get_snapshots(occ_symbols)
+                    enriched = 0
+                    for sig in signals:
+                        snap = snapshots.get(sig.option_symbol)
+                        if snap and snap.get("iv") is not None:
+                            # Use raw IV as proxy (0-1 scale → 0-100 percentage)
+                            sig.iv_rank = round(snap["iv"] * 100, 1)
+                            enriched += 1
+                    log.info("iv_enrichment", total=len(signals), enriched=enriched)
+            except Exception as e:
+                log.warning("iv_enrichment_failed", error=str(e))
+
         log.info("uw_signals_parsed", total=len(new_flows), passed_filter=len(signals))
         return signals
 
@@ -333,6 +352,7 @@ class UnusualWhalesClient:
             open_interest=oi,
             vol_oi_ratio=round(vol_oi, 2),
             option_type=option_type,
+            option_symbol=occ_sym,
             order_type=order_type,
             underlying_price=underlying_price,
             iv_rank=0.0,  # Not directly available from flow-alerts

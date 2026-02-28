@@ -40,6 +40,7 @@ class SafetyGate:
         If any single check fails, the entry is blocked.
         """
         checks = [
+            self._check_option_type,
             self._check_excluded_ticker,
             self._check_max_positions,
             self._check_max_exposure,
@@ -74,6 +75,13 @@ class SafetyGate:
             limit_price=signal.get("limit_price", 0),
         )
         return True, "All safety checks passed"
+
+    def _check_option_type(self, signal: dict) -> tuple[bool, str]:
+        """Enforce calls-only strategy."""
+        option_type = signal.get("option_type", "").upper()
+        if option_type and option_type != "CALL":
+            return False, f"Non-CALL option type: {option_type}"
+        return True, ""
 
     def _check_excluded_ticker(self, signal: dict) -> tuple[bool, str]:
         ticker = signal.get("ticker", "").upper()

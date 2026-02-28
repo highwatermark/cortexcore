@@ -27,7 +27,7 @@ from services.alpaca_broker import get_broker
 from core.utils import TZ
 from services.telegram import TelegramNotifier
 from core.reconciler import reconcile_positions
-from tools.execution_tools import reconcile_orders
+from tools.execution_tools import execute_exit, reconcile_orders
 from tools.flow_tools import scan_flow, score_signal, save_signal, send_scan_report
 from tools.position_tools import get_open_positions, check_exit_triggers, refresh_positions
 from tools.risk_tools import calculate_portfolio_risk, pre_trade_check
@@ -262,18 +262,52 @@ class MonitorLoop:
                 except Exception as e:
                     log.error("entry_evaluation_failed", error=str(e))
 
-            # Exit decisions: Claude evaluates triggered positions
+            # Exit decisions: deterministic for critical triggers, Claude for the rest
             if triggered:
-                try:
-                    exit_result = await self.orchestrator.evaluate_exits(
-                        triggered_positions=triggered,
-                        risk_assessment=risk_assessment,
-                        market_context=market_context,
-                    )
-                    claude_calls += 1
-                    log.info("exit_decision", result_preview=exit_result[:200] if exit_result else "")
-                except Exception as e:
-                    log.error("exit_evaluation_failed", error=str(e))
+                deterministic_exits = []
+                claude_exits = []
+
+                for pos, trigger in triggered:
+                    is_critical = trigger.get("urgency") == "critical"
+                    trigger_names = trigger.get("triggers", [])
+                    is_hard_stop = any("STOP_LOSS" in t for t in trigger_names)
+                    is_dte_mandatory = any("DTE_MANDATORY" in t for t in trigger_names)
+
+                    if is_critical or is_hard_stop or is_dte_mandatory:
+                        deterministic_exits.append((pos, trigger))
+                    else:
+                        claude_exits.append((pos, trigger))
+
+                # Execute deterministic exits immediately — no Claude involvement
+                for pos, trigger in deterministic_exits:
+                    try:
+                        reason = trigger.get("triggers", ["deterministic_exit"])[0]
+                        log.warning("deterministic_exit_executing",
+                            position_id=pos["position_id"],
+                            ticker=pos.get("ticker"),
+                            trigger=reason,
+                            pnl_pct=pos.get("pnl_pct"))
+                        await execute_exit(
+                            position_id=pos["position_id"],
+                            reason=f"DETERMINISTIC: {reason}",
+                            use_market=True,
+                        )
+                    except Exception as e:
+                        log.error("deterministic_exit_failed",
+                            position_id=pos["position_id"], error=str(e))
+
+                # Only send remaining non-critical exits to Claude
+                if claude_exits:
+                    try:
+                        exit_result = await self.orchestrator.evaluate_exits(
+                            triggered_positions=claude_exits,
+                            risk_assessment=risk_assessment,
+                            market_context=market_context,
+                        )
+                        claude_calls += 1
+                        log.info("exit_decision", result_preview=exit_result[:200] if exit_result else "")
+                    except Exception as e:
+                        log.error("exit_evaluation_failed", error=str(e))
 
             # =========================================================
             # CYCLE SUMMARY
@@ -313,21 +347,36 @@ class MonitorLoop:
         await asyncio.sleep(interval)
 
     async def _deterministic_position_check(self) -> None:
-        """Check positions without Claude (used during trading breaker)."""
+        """Check positions and execute critical exits deterministically (used during trading breaker)."""
         try:
             positions = get_open_positions()
-            risk_assessment = calculate_portfolio_risk()
             triggered: list[tuple[dict, dict]] = []
             for pos in positions:
                 trigger_result = check_exit_triggers(pos)
                 if trigger_result.get("should_exit"):
                     triggered.append((pos, trigger_result))
 
-            if triggered:
-                try:
-                    await self.orchestrator.evaluate_exits(triggered, risk_assessment, market_context=None)
-                except Exception as e:
-                    log.error("breaker_exit_eval_failed", error=str(e))
+            for pos, trigger in triggered:
+                is_critical = trigger.get("urgency") == "critical"
+                trigger_names = trigger.get("triggers", [])
+                is_hard_stop = any("STOP_LOSS" in t for t in trigger_names)
+                is_dte_mandatory = any("DTE_MANDATORY" in t for t in trigger_names)
+
+                if is_critical or is_hard_stop or is_dte_mandatory:
+                    try:
+                        reason = trigger.get("triggers", ["deterministic_exit"])[0]
+                        log.warning("breaker_deterministic_exit",
+                            position_id=pos["position_id"],
+                            ticker=pos.get("ticker"),
+                            trigger=reason)
+                        await execute_exit(
+                            position_id=pos["position_id"],
+                            reason=f"DETERMINISTIC (breaker): {reason}",
+                            use_market=True,
+                        )
+                    except Exception as e:
+                        log.error("breaker_exit_failed",
+                            position_id=pos["position_id"], error=str(e))
 
             log.info("position_check_done", positions=len(positions), triggers=len(triggered))
         except Exception as e:

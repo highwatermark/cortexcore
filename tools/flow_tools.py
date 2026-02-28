@@ -96,6 +96,18 @@ def score_signal(signal: dict) -> dict:
     score = 0
     breakdown: list[str] = []
 
+    # Hard reject non-CALL options before scoring
+    if signal.get("option_type", "").upper() not in ("CALL", ""):
+        log.info("signal_rejected_non_call", ticker=signal.get("ticker"), option_type=signal.get("option_type"))
+        return {
+            "signal_id": signal.get("signal_id", ""),
+            "ticker": signal.get("ticker", ""),
+            "score": 0,
+            "breakdown": "non_call:blocked",
+            "passed": False,
+            "min_required": settings.flow.min_score,
+        }
+
     # --- Reward indicators ---
     order_type = signal.get("order_type", "").lower()
     if "sweep" in order_type:

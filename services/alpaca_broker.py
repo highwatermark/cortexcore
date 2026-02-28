@@ -183,9 +183,16 @@ class AlpacaBroker:
         """Check the status of an existing order."""
         try:
             order = self._client.get_order_by_id(order_id)
+            # Normalize status: Alpaca returns enum objects (e.g. OrderStatus.filled).
+            # Extract the .value for consistent lowercase string comparison downstream.
+            raw_status = order.status
+            if hasattr(raw_status, "value"):
+                status_str = str(raw_status.value).lower()
+            else:
+                status_str = str(raw_status).lower()
             return {
                 "id": str(order.id),
-                "status": str(order.status),
+                "status": status_str,
                 "filled_qty": int(order.filled_qty or 0),
                 "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else None,
                 "symbol": order.symbol,
