@@ -23,10 +23,23 @@ log = get_logger("position_tools")
 
 
 def get_open_positions() -> list[dict]:
-    """Get all open positions with current P&L from both DB and broker.
+    """Get all open positions — broker is source of truth, DB enriches.
+
+    Starts from broker positions (what actually exists), then enriches
+    with DB metadata (Greeks, conviction, thesis). Positions only in DB
+    but not in broker are ignored (reconciler handles cleanup).
 
     Returns list of position dicts with full details.
     """
+    # BROKER FIRST — these are the real positions
+    broker = AlpacaBroker()
+    broker_positions = broker.get_positions()
+
+    if not broker_positions:
+        log.info("positions_fetched", count=0, source="broker")
+        return []
+
+    # DB enrichment — look up metadata the broker doesn't track
     session = get_session()
     try:
         db_positions = (
@@ -34,47 +47,68 @@ def get_open_positions() -> list[dict]:
             .filter(PositionRecord.status == PositionStatus.OPEN)
             .all()
         )
+        db_map = {p.option_symbol: p for p in db_positions}
 
-        # Merge with live broker data
-        broker = AlpacaBroker()
-        broker_positions = broker.get_positions()
-        broker_map = {p.option_symbol: p for p in broker_positions}
+        # Build set of abandoned symbols to suppress from monitoring pipeline
+        abandoned_symbols = set(
+            row.option_symbol for row in
+            session.query(PositionRecord.option_symbol)
+            .filter(PositionRecord.status == PositionStatus.ABANDONED)
+            .all()
+        )
 
-        results = []
-        for pos in db_positions:
-            live = broker_map.get(pos.option_symbol)
-            current_price = live.current_price if live else (pos.current_price or pos.entry_price)
-            pnl_pct = ((current_price - pos.entry_price) / pos.entry_price * 100) if pos.entry_price else 0
-            pnl_dollars = (current_price - pos.entry_price) * pos.quantity * 100  # options multiplier
-
-            # Calculate remaining DTE (uses Pacific time via core.utils)
-            dte_remaining = calc_dte(pos.expiration) if pos.expiration else 0
-
-            results.append({
-                "position_id": pos.position_id,
-                "ticker": pos.ticker,
-                "option_symbol": pos.option_symbol,
-                "action": pos.action.value if pos.action else "CALL",
-                "strike": pos.strike,
-                "expiration": pos.expiration,
-                "quantity": pos.quantity,
-                "entry_price": pos.entry_price,
-                "current_price": round(current_price, 2),
-                "pnl_pct": round(pnl_pct, 2),
-                "pnl_dollars": round(pnl_dollars, 2),
-                "delta": pos.delta or 0,
-                "gamma": pos.gamma or 0,
-                "theta": pos.theta or 0,
-                "vega": pos.vega or 0,
-                "conviction": pos.conviction,
-                "dte_remaining": dte_remaining,
-                "entry_thesis": pos.entry_thesis,
-            })
-
-        log.info("positions_fetched", count=len(results))
-        return results
+        # Log DB-only phantoms for visibility (reconciler will clean up)
+        for symbol, db_pos in db_map.items():
+            if not any(bp.option_symbol == symbol for bp in broker_positions):
+                log.warning(
+                    "db_phantom_detected",
+                    position_id=db_pos.position_id,
+                    ticker=db_pos.ticker,
+                    option_symbol=symbol,
+                    msg="DB has OPEN but broker does not — reconciler will clean up",
+                )
     finally:
         session.close()
+
+    # Filter out abandoned positions — broker still holds them but we
+    # can't exit them, so suppress from the entire monitoring pipeline
+    if abandoned_symbols:
+        before = len(broker_positions)
+        broker_positions = [bp for bp in broker_positions if bp.option_symbol not in abandoned_symbols]
+        if before != len(broker_positions):
+            log.info("abandoned_positions_filtered",
+                filtered=before - len(broker_positions),
+                symbols=list(abandoned_symbols))
+
+    results = []
+    for bp in broker_positions:
+        db_pos = db_map.get(bp.option_symbol)
+
+        results.append({
+            "position_id": db_pos.position_id if db_pos else bp.position_id,
+            "ticker": bp.ticker,
+            "option_symbol": bp.option_symbol,
+            "action": bp.action.value if bp.action else "CALL",
+            "strike": bp.strike,
+            "expiration": bp.expiration,
+            "quantity": bp.quantity,
+            "entry_price": bp.entry_price,
+            "current_price": round(bp.current_price, 2),
+            "pnl_pct": round(bp.pnl_pct, 2),
+            "pnl_dollars": round(bp.pnl_dollars, 2),
+            # Greeks from DB (broker doesn't track these)
+            "delta": db_pos.delta or 0 if db_pos else 0,
+            "gamma": db_pos.gamma or 0 if db_pos else 0,
+            "theta": db_pos.theta or 0 if db_pos else 0,
+            "vega": db_pos.vega or 0 if db_pos else 0,
+            "conviction": db_pos.conviction if db_pos else 0,
+            "dte_remaining": bp.dte_remaining,
+            "entry_thesis": db_pos.entry_thesis if db_pos else "",
+            "in_db": db_pos is not None,
+        })
+
+    log.info("positions_fetched", count=len(results), source="broker")
+    return results
 
 
 def _get_adaptive_profit_target(dte: int) -> float:

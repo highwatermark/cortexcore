@@ -70,17 +70,12 @@ def calculate_position_size(option_price: float, equity: float | None = None) ->
     # Limit 2: max_position_value ($1,000 absolute cap)
     max_by_position_value = int(trading.max_position_value / cost_per_contract)
 
-    # Limit 3: remaining capacity under total exposure
-    session = get_session()
+    # Limit 3: remaining capacity under total exposure — BROKER is source of truth
     try:
-        positions = (
-            session.query(PositionRecord)
-            .filter(PositionRecord.status == PositionStatus.OPEN)
-            .all()
-        )
-        current_exposure = sum((p.entry_value or 0) for p in positions)
-    finally:
-        session.close()
+        broker_positions = AlpacaBroker().get_positions()
+        current_exposure = sum(bp.entry_price * bp.quantity * 100 for bp in broker_positions)
+    except Exception:
+        current_exposure = equity  # Conservative: assume full exposure if broker unreachable
 
     max_total_exposure = equity * trading.max_total_exposure_pct
     remaining_capacity = max_total_exposure - current_exposure
@@ -503,10 +498,101 @@ async def execute_exit(
             )
 
         if not result.success:
-            intent.status = IntentStatus.FAILED
-            session.commit()
-            log.error("exit_failed", position_id=position_id, error=result.error)
-            return {"success": False, "error": result.error}
+            # --- Limit fallback: try $0.01 limit sell on "no available quote" ---
+            is_no_quote = "no available quote" in (result.error or "").lower()
+            if is_no_quote and should_use_market:
+                log.warning("exit_market_failed_trying_limit_penny",
+                    position_id=position_id, original_error=result.error)
+                result = broker.submit_limit_order(
+                    symbol=pos.option_symbol,
+                    side=OrderSide.SELL,
+                    qty=pos.quantity,
+                    limit_price=0.01,
+                )
+                if result.success:
+                    # Penny limit accepted — continue normal flow below
+                    should_use_market = False
+                    exit_limit_price = 0.01
+                    log.info("exit_penny_limit_submitted",
+                        position_id=position_id,
+                        order_id=result.broker_order_id)
+
+            if not result.success:
+                # --- Increment exit fail counter ---
+                pos.exit_fail_count = (pos.exit_fail_count or 0) + 1
+                settings = get_settings()
+                max_failures = settings.monitor.max_exit_failures
+
+                # --- Auto-abandon after max failures ---
+                if pos.exit_fail_count >= max_failures:
+                    log.warning("position_auto_abandoned",
+                        position_id=position_id,
+                        ticker=pos.ticker,
+                        exit_fail_count=pos.exit_fail_count,
+                        max_failures=max_failures)
+
+                    pos.status = PositionStatus.ABANDONED
+                    pos.closed_at = datetime.now(timezone.utc)
+
+                    # Record the total loss in trade log
+                    pnl_dollars = -pos.entry_price * pos.quantity * 100
+                    pnl_pct = -100.0
+                    hold_hours = 0.0
+                    if pos.opened_at:
+                        hold_hours = (datetime.now(timezone.utc) - ensure_utc(pos.opened_at)).total_seconds() / 3600
+
+                    trade = TradeLog(
+                        position_id=position_id,
+                        ticker=pos.ticker,
+                        action=pos.action,
+                        entry_price=pos.entry_price,
+                        exit_price=0.0,
+                        quantity=pos.quantity,
+                        pnl_dollars=round(pnl_dollars, 2),
+                        pnl_pct=round(pnl_pct, 2),
+                        hold_duration_hours=round(hold_hours, 1),
+                        entry_thesis=pos.entry_thesis,
+                        exit_reason=f"ABANDONED after {pos.exit_fail_count} exit failures",
+                        opened_at=pos.opened_at,
+                    )
+                    session.add(trade)
+
+                    # Delete stuck exit intent so it doesn't block future logic
+                    if existing is None:
+                        existing = session.query(OrderIntent).filter(
+                            OrderIntent.idempotency_key == idemp_key
+                        ).first()
+                    if existing:
+                        session.delete(existing)
+                    # Also delete the intent we just created
+                    session.delete(intent)
+
+                    session.commit()
+
+                    # Notify
+                    try:
+                        notifier = TelegramNotifier()
+                        await notifier.send(
+                            f"<b>Position ABANDONED</b>\n"
+                            f"{pos.ticker} {pos.option_symbol}\n"
+                            f"After {pos.exit_fail_count} failed exit attempts\n"
+                            f"P&L: ${pnl_dollars:.2f} (-100%)\n"
+                            f"Reason: illiquid, no buyers"
+                        )
+                    except Exception as ne:
+                        log.warning("notify_abandon_failed", error=str(ne))
+
+                    return {
+                        "success": False,
+                        "error": f"Position ABANDONED after {pos.exit_fail_count} exit failures",
+                        "abandoned": True,
+                    }
+
+                intent.status = IntentStatus.FAILED
+                session.commit()
+                log.error("exit_failed", position_id=position_id,
+                    error=result.error, exit_fail_count=pos.exit_fail_count)
+                return {"success": False, "error": result.error}
 
         intent.broker_order_id = result.broker_order_id
 

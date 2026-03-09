@@ -181,6 +181,9 @@ class MonitorConfig(BaseSettings):
     max_consecutive_errors: int = Field(5, ge=1)
     circuit_breaker_cooldown_seconds: int = Field(7200, ge=30)
 
+    # Exit failure auto-abandon
+    max_exit_failures: int = Field(10, ge=1)
+
     # Trading circuit breakers
     max_consecutive_losses: int = Field(2, ge=1)
     max_daily_loss_pct: float = Field(0.05, gt=0, le=1.0)

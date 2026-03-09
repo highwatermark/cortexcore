@@ -1,7 +1,16 @@
 """Tests for position management tools."""
 from __future__ import annotations
 
-from tools.position_tools import check_exit_triggers, _get_adaptive_profit_target
+from unittest.mock import MagicMock, patch
+
+from data.models import (
+    PositionRecord,
+    PositionStatus,
+    SignalAction,
+    init_db,
+    get_session,
+)
+from tools.position_tools import check_exit_triggers, get_open_positions, _get_adaptive_profit_target
 
 
 class TestExitTriggers:
@@ -177,3 +186,70 @@ class TestMandatoryDteExit:
         }
         result = check_exit_triggers(position)
         assert not any("DTE_MANDATORY" in t for t in result["triggers"])
+
+
+class TestAbandonedPositionFiltering:
+    """Test that get_open_positions excludes ABANDONED positions."""
+
+    def setup_method(self) -> None:
+        init_db(":memory:")
+
+    @patch("tools.position_tools.AlpacaBroker")
+    def test_abandoned_positions_excluded(self, mock_broker_cls) -> None:
+        """Broker positions with ABANDONED DB record are filtered out."""
+        # Create broker mock with two positions
+        bp_active = MagicMock()
+        bp_active.position_id = "bp-1"
+        bp_active.ticker = "AAPL"
+        bp_active.option_symbol = "AAPL260320C00200000"
+        bp_active.action = SignalAction.CALL
+        bp_active.strike = 200.0
+        bp_active.expiration = "2026-03-20"
+        bp_active.quantity = 1
+        bp_active.entry_price = 3.50
+        bp_active.current_price = 4.00
+        bp_active.pnl_pct = 14.29
+        bp_active.pnl_dollars = 50.0
+        bp_active.dte_remaining = 30
+
+        bp_abandoned = MagicMock()
+        bp_abandoned.position_id = "bp-2"
+        bp_abandoned.ticker = "ARRY"
+        bp_abandoned.option_symbol = "ARRY260320C00012000"
+        bp_abandoned.action = SignalAction.CALL
+        bp_abandoned.strike = 12.0
+        bp_abandoned.expiration = "2026-03-20"
+        bp_abandoned.quantity = 7
+        bp_abandoned.entry_price = 0.65
+        bp_abandoned.current_price = 0.0
+        bp_abandoned.pnl_pct = -100.0
+        bp_abandoned.pnl_dollars = -455.0
+        bp_abandoned.dte_remaining = 12
+
+        broker = MagicMock()
+        broker.get_positions.return_value = [bp_active, bp_abandoned]
+        mock_broker_cls.return_value = broker
+
+        # Create DB records: one OPEN, one ABANDONED
+        session = get_session()
+        session.add(PositionRecord(
+            position_id="pos-1", signal_id="sig-1", ticker="AAPL",
+            option_symbol="AAPL260320C00200000", action=SignalAction.CALL,
+            strike=200, expiration="2026-03-20", quantity=1,
+            entry_price=3.50, entry_value=350, status=PositionStatus.OPEN,
+        ))
+        session.add(PositionRecord(
+            position_id="pos-2", signal_id="sig-2", ticker="ARRY",
+            option_symbol="ARRY260320C00012000", action=SignalAction.CALL,
+            strike=12, expiration="2026-03-20", quantity=7,
+            entry_price=0.65, entry_value=455, status=PositionStatus.ABANDONED,
+        ))
+        session.commit()
+        session.close()
+
+        results = get_open_positions()
+
+        assert len(results) == 1
+        assert results[0]["ticker"] == "AAPL"
+        # ARRY should be filtered out
+        assert not any(r["ticker"] == "ARRY" for r in results)

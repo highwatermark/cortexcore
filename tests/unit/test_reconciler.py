@@ -167,6 +167,47 @@ class TestReconcilePositions:
         assert pos.current_price == 5.00
 
 
+    @pytest.mark.asyncio
+    @patch("core.reconciler.TelegramNotifier")
+    @patch("core.reconciler.get_broker")
+    async def test_orphan_skipped_when_abandoned(self, mock_get_broker, mock_notifier_cls) -> None:
+        """Orphan position not adopted when ABANDONED position exists for same symbol."""
+        mock_broker = MagicMock()
+        snapshot = _make_broker_snapshot(
+            option_symbol="ARRY260320C00012000",
+            ticker="ARRY",
+        )
+        mock_broker.get_positions.return_value = [snapshot]
+        mock_get_broker.return_value = mock_broker
+
+        mock_notifier = AsyncMock()
+        mock_notifier_cls.return_value = mock_notifier
+
+        # Add ABANDONED position for the same symbol
+        session = get_session()
+        session.add(PositionRecord(
+            position_id="pos-abandoned", signal_id="sig-1", ticker="ARRY",
+            option_symbol="ARRY260320C00012000", action=SignalAction.CALL,
+            strike=12, expiration="2026-03-20", quantity=7,
+            entry_price=0.65, entry_value=455, status=PositionStatus.ABANDONED,
+        ))
+        session.commit()
+        session.close()
+
+        result = await reconcile_positions()
+        assert result["orphans_adopted"] == 0
+        assert result["skipped_orphans"] == 1
+
+        # Verify no new position was created
+        session = get_session()
+        count = session.query(PositionRecord).filter(
+            PositionRecord.option_symbol == "ARRY260320C00012000",
+            PositionRecord.status == PositionStatus.OPEN,
+        ).count()
+        session.close()
+        assert count == 0
+
+
 class TestHealthChecker:
     def setup_method(self) -> None:
         init_db(":memory:")

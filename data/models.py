@@ -43,6 +43,7 @@ class PositionStatus(str, enum.Enum):
     OPEN = "OPEN"
     CLOSED = "CLOSED"
     ROLLING = "ROLLING"
+    ABANDONED = "ABANDONED"
 
 
 class OrderSide(str, enum.Enum):
@@ -138,6 +139,8 @@ class PositionRecord(Base):
     # Thesis
     entry_thesis = Column(Text, default="")
     conviction = Column(Integer, default=0)
+    # Exit failure tracking
+    exit_fail_count = Column(Integer, default=0)
     # Timestamps
     opened_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     closed_at = Column(DateTime, nullable=True)
