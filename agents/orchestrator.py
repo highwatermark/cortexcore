@@ -35,24 +35,24 @@ RETRY_BASE_DELAY = 2  # seconds
 # ---------------------------------------------------------------------------
 
 DECISION_TOOLS = [
-    # {
-    #     "name": "calculate_position_size",
-    #     "description": (
-    #         "Calculate the maximum number of contracts for a new position based on "
-    #         "current equity, existing exposure, and risk limits. Returns max_contracts "
-    #         "and the limiting factor. Call this BEFORE execute_entry."
-    #     ),
-    #     "input_schema": {
-    #         "type": "object",
-    #         "properties": {
-    #             "option_price": {
-    #                 "type": "number",
-    #                 "description": "The option premium per contract (e.g., 2.50 for $250/contract)",
-    #             },
-    #         },
-    #         "required": ["option_price"],
-    #     },
-    # },
+    {
+        "name": "calculate_position_size",
+        "description": (
+            "Calculate the maximum number of contracts for a new position based on "
+            "current equity, existing exposure, and risk limits. Returns max_contracts "
+            "and the limiting factor. Call this BEFORE execute_entry."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "option_price": {
+                    "type": "number",
+                    "description": "The option premium per contract (e.g., 2.50 for $250/contract)",
+                },
+            },
+            "required": ["option_price"],
+        },
+    },
     {
         "name": "execute_entry",
         "description": (
@@ -120,10 +120,9 @@ You receive pre-computed data from a deterministic pipeline:
 Your job is to decide for each signal: TRADE or SKIP.
 
 For TRADE signals:
-1. Use the SIZING CONSTRAINTS provided to calculate quantity yourself:
-   quantity = floor(min(per_trade_cap, position_value_cap, remaining_capacity) / (option_price * 100))
-   If quantity is 0, SKIP (option too expensive for current limits).
-2. Call execute_entry directly with your conviction (0-100), thesis, and quantity.
+1. Call calculate_position_size(option_price) to get max_contracts.
+   If max_contracts is 0, SKIP (option too expensive for current limits).
+2. Call execute_entry with quantity <= max_contracts, your conviction (0-100), and thesis.
 
 RISK RULES (non-negotiable):
 - Never enter if risk_level is CRITICAL
@@ -437,8 +436,8 @@ class Orchestrator:
         """Pre-compute position sizing constraints for Claude."""
         trading = self._settings.trading
         try:
-            from services.alpaca_broker import AlpacaBroker
-            account = AlpacaBroker().get_account()
+            from services.alpaca_broker import get_broker
+            account = get_broker().get_account()
             equity = account.get("equity", 0)
         except Exception:
             return "SIZING CONSTRAINTS:\n  (equity unavailable — skip all trades)\n"
@@ -446,16 +445,14 @@ class Orchestrator:
         current_exposure = sum((p.get("entry_value", 0) or 0) for p in positions)
         max_total = equity * trading.max_total_exposure_pct
         remaining_capacity = max(0, max_total - current_exposure)
-        per_trade_cap = equity * trading.max_per_trade_pct
 
         return (
             f"SIZING CONSTRAINTS:\n"
             f"  Equity: ${equity:,.0f}\n"
-            f"  Per-trade cap (20% equity): ${per_trade_cap:,.0f}\n"
+            f"  Per-trade cap: ${equity * trading.max_per_trade_pct:,.0f}\n"
             f"  Position value cap: ${trading.max_position_value:,.0f}\n"
             f"  Remaining exposure capacity: ${remaining_capacity:,.0f}\n"
-            f"  Formula: quantity = floor(min(per_trade_cap, position_value_cap, remaining_capacity) / (option_price × 100))\n"
-            f"  If quantity = 0, the option is too expensive — SKIP.\n"
+            f"  Use calculate_position_size(option_price) tool to get exact quantity.\n"
         )
 
     def get_performance_context(self) -> str:
