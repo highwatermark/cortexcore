@@ -8,7 +8,7 @@
 
 3. **Fail-closed on safety, fail-open on data.** Missing earnings data? Allow the trade (fail-open). Safety check can't verify equity? Block the trade (fail-closed). When in doubt, block.
 
-4. **Signal dedup marks signals as "seen" at scan time, not execution time.** If a signal fails a temporary gate (market timing, cooldown), it's gone forever. Never add temporary blocking gates without understanding this implication.
+4. **Signal dedup marks signals as "seen" at scan time, "accepted" at pre-trade check time.** Signals that fail temporary gates (market timing, cooldown) are eligible for rescore on the next cycle. Only signals that pass all pre-trade checks are permanently blocked from rescore. Higher premium always allows rescore.
 
 5. **Do not add complexity without evidence.** No speculative abstractions. No "future-proofing." If a three-line solution works, use it. The system trades real money — simplicity is safety.
 
@@ -61,7 +61,8 @@ The reconciler (`core/reconciler.py`) syncs DB with broker every 5 cycles. It ha
 - Stop loss: -35%, mandatory exit at DTE <= 5
 - Circuit breakers: 5% daily loss, 10% weekly loss, 2 consecutive losses (120 min cooldown)
 - **Calls only, ASK-side only** — no puts, no BID-side
-- DTE 6+, no upper limit (LEAPs allowed), premium $50-$500/contract, IV rank < 70%
+- DTE 6+, no upper limit (LEAPs allowed), premium $50-$500/contract, IV rank < 70% (true percentile vs 52-week realized vol)
+- Spread gate: blocks entries with bid-ask spread > 15% (bid/ask populated from Alpaca snapshots during IV enrichment)
 
 ## Common Tasks
 
@@ -87,7 +88,7 @@ journalctl -u momentum-agent -f
 
 ## Before Making Changes
 
-1. Run full test suite: `.venv/bin/python -m pytest tests/ -v` (must be 177 passing)
+1. Run full test suite: `.venv/bin/python -m pytest tests/ -v` (195 passing, 2 pre-existing flaky DTE tests)
 2. Check `docs/IMPLEMENTATION_PLAN.md` for related phase
 3. If modifying position logic: verify it queries broker first, then DB for enrichment
 4. If adding new gate: add to `core/safety.py`, test both allow and block paths
@@ -98,7 +99,7 @@ journalctl -u momentum-agent -f
 
 ```
 config/settings.py          # Single source of truth for all parameters
-core/safety.py              # 13 deterministic safety gates (non-overridable)
+core/safety.py              # 13 deterministic safety gates (non-overridable, spread gate now active)
 core/circuit_breaker.py     # Loss-based trading halts
 core/reconciler.py          # Broker <-> DB sync with 5 safety guards
 core/killswitch.py          # Emergency halt
@@ -120,3 +121,8 @@ analytics/performance.py    # Win rate, Sharpe, drawdown
 - Mock paths: use `services.alpaca_broker.get_broker` not `core.safety.get_broker` for patching.
 - **Safety gate consecutive-loss deadlock (fixed 2026-03-14):** `_check_consecutive_losses` in `safety.py` had NO cooldown — it permanently blocked all entries when last 2 trades were losses. Since no new trades could happen, the counter never cleared, creating a permanent deadlock. The circuit breaker in `circuit_breaker.py` already handles this with a 120-min cooldown. Removed the duplicate check from the safety gate. Rule: never put a check in the safety gate that requires a trade to clear it.
 - systemd `StartLimitIntervalSec` goes in [Unit] not [Service].
+- **IV rank was raw IV, not percentile (fixed 2026-03-14):** `sig.iv_rank = round(snap["iv"] * 100, 1)` stored raw implied volatility as "IV rank". A stock with 35% IV got iv_rank=35.0 regardless of whether that was historically cheap or expensive. Now computes true IV rank as percentile of current IV vs 52-week rolling realized vol. Cached per ticker per day.
+- **Spread gate was dead (fixed 2026-03-14):** The `_check_spread` gate in safety.py checked `signal.get("bid", 0)` but UW flow signals never include bid/ask. Gate always returned `(True, "")`. Now bid/ask are populated from Alpaca option snapshots during IV enrichment. Illiquid options with wide spreads are now blocked.
+- **Performance context silently crashed (fixed 2026-03-14):** `self._broker.get_positions()` in `orchestrator.py` referenced a non-existent attribute. Exception caught silently, Claude never saw win rate, consecutive losses, or drawdown. Fixed to use `get_broker()`.
+- **Signal dedup at scan time lost good signals (fixed 2026-03-14):** Signals failing temporary gates were permanently lost. Changed to two-phase: "seen" at scan, "accepted" at pre-trade check. Rejected signals eligible for rescore.
+- **Orphan conviction default was 0 (fixed 2026-03-14):** Orphan positions (in broker but not DB) got conviction=0, immediately triggering CONVICTION_DROP exit (threshold 50). Changed default to 75.
