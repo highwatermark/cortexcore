@@ -66,11 +66,15 @@ class AlpacaOptionsData:
             try:
                 # Price: prefer mid-quote, fall back to latest trade
                 current_price = None
+                bid_price = None
+                ask_price = None
                 if snap.latest_quote:
                     bid = snap.latest_quote.bid_price
                     ask = snap.latest_quote.ask_price
                     if bid and ask and bid > 0 and ask > 0:
                         current_price = round((bid + ask) / 2, 4)
+                        bid_price = bid
+                        ask_price = ask
                 if current_price is None and snap.latest_trade:
                     current_price = snap.latest_trade.price
 
@@ -81,6 +85,8 @@ class AlpacaOptionsData:
                 greeks = snap.greeks
                 results[symbol] = {
                     "current_price": current_price,
+                    "bid": bid_price,
+                    "ask": ask_price,
                     "delta": greeks.delta if greeks else None,
                     "gamma": greeks.gamma if greeks else None,
                     "theta": greeks.theta if greeks else None,

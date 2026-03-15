@@ -21,6 +21,7 @@ import anthropic
 
 from config.settings import get_settings
 from core.logger import get_logger
+from services.alpaca_broker import get_broker
 from tools import dispatch_tool
 
 log = get_logger("orchestrator")
@@ -482,7 +483,7 @@ class Orchestrator:
                     .count()
                 )
                 try:
-                    open_positions = len(self._broker.get_positions())
+                    open_positions = len(get_broker().get_positions())
                 except Exception:
                     open_positions = 0
                 recent = (

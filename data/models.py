@@ -240,6 +240,10 @@ class FlowSignal(BaseModel):
     trade_count: int = 0
     next_earnings_date: str = ""
 
+    # Bid/ask from Alpaca snapshot (for spread gate)
+    bid: float = 0.0
+    ask: float = 0.0
+
 
 class PositionSnapshot(BaseModel):
     """Current state of an open position."""

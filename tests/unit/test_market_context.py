@@ -157,3 +157,30 @@ class TestFormatMarketContext:
         assert "NORMAL regime" in result
         assert "SPY" in result
         assert "$525.40" in result
+
+
+class TestGetSnapshotsWithQuotes:
+    def test_snapshots_include_bid_ask(self) -> None:
+        """get_snapshots should return bid and ask prices from latest_quote."""
+        from services.alpaca_options_data import AlpacaOptionsData
+        from unittest.mock import patch, MagicMock
+
+        mock_snap = MagicMock()
+        mock_snap.latest_quote.bid_price = 3.50
+        mock_snap.latest_quote.ask_price = 3.80
+        mock_snap.latest_trade.price = 3.65
+        mock_snap.greeks.delta = 0.5
+        mock_snap.greeks.gamma = 0.02
+        mock_snap.greeks.theta = -0.03
+        mock_snap.greeks.vega = 0.1
+        mock_snap.implied_volatility = 0.35
+
+        with patch.object(AlpacaOptionsData, '__init__', lambda self: None):
+            client = AlpacaOptionsData()
+            client._client = MagicMock()
+            client._client.get_option_snapshot.return_value = {"AAPL260320C00200000": mock_snap}
+
+            result = client.get_snapshots(["AAPL260320C00200000"])
+            snap = result["AAPL260320C00200000"]
+            assert snap["bid"] == 3.50
+            assert snap["ask"] == 3.80
