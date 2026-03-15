@@ -464,8 +464,6 @@ class Orchestrator:
             from data.models import (
                 IntentStatus,
                 OrderIntent,
-                PositionRecord,
-                PositionStatus,
                 TradeLog,
                 get_session,
             )
@@ -483,11 +481,10 @@ class Orchestrator:
                     )
                     .count()
                 )
-                open_positions = (
-                    session.query(PositionRecord)
-                    .filter(PositionRecord.status == PositionStatus.OPEN)
-                    .count()
-                )
+                try:
+                    open_positions = len(self._broker.get_positions())
+                except Exception:
+                    open_positions = 0
                 recent = (
                     session.query(TradeLog)
                     .order_by(TradeLog.closed_at.desc())

@@ -99,7 +99,7 @@ config/
         risk_manager.md
         executor.md
 core/
-    safety.py                # 14-point deterministic safety gate
+    safety.py                # 13-point deterministic safety gate
     circuit_breaker.py       # Loss-based trading halts (daily/weekly/consecutive)
     killswitch.py            # File-based emergency halt
     health.py                # Dependency health checks (APIs, DB, disk)
@@ -111,6 +111,7 @@ data/
 services/
     unusual_whales.py        # UW flow-alerts client with newer_than watermark
     alpaca_broker.py         # Alpaca order submission + account queries
+    alpaca_options_data.py   # Alpaca options data client (Greeks, IV, bid/ask snapshots)
     telegram.py              # Telegram notification service
 tools/
     flow_tools.py            # scan_flow, score_signal, save_signal, send_scan_report
@@ -125,12 +126,13 @@ monitor/
 analytics/
     performance.py           # Win rate, profit factor, Sharpe, max drawdown
 bot/
-    commands.py              # Telegram bot (13+ commands, auth-gated)
+    commands.py              # Telegram bot (15 commands, auth-gated)
 scripts/
     run.py                   # CLI entry point
 tests/
     unit/                    # Unit tests
     e2e/                     # End-to-end tests (requires live APIs)
+    scenarios/               # Scenario-based integration tests
 ```
 
 ## Signal Scoring
@@ -159,7 +161,7 @@ Signals from Unusual Whales are scored on a 0-10 scale. Minimum to pass: **7**.
 |------------------------|--------|
 | IV rank > 70%          | -3     |
 | DTE < 6                | -2     |
-| DTE 6-14               | -1     |
+| DTE 6-13               | -1     |
 | Earnings within 7 days | -2     |
 | Non-CALL option        | blocked|
 
@@ -178,22 +180,23 @@ Signals from Unusual Whales are scored on a 0-10 scale. Minimum to pass: **7**.
 
 ### Safety Gate (`core/safety.py`)
 
-14 deterministic checks executed before **every** order submission. These cannot be overridden by the AI agent:
+13 deterministic checks executed before **every** order submission. These cannot be overridden by the AI agent:
 
-1. Excluded ticker blocklist
-2. Max positions (3)
-3. Max total exposure (25% of equity)
-4. Max position value ($1,000)
-5. Max executions per day (2)
-6. Daily loss limit (5% of equity)
-7. Weekly loss limit (10% of equity)
-8. Consecutive loss limit (2)
+1. Calls-only enforcement (non-CALL types hard-blocked)
+2. Excluded ticker blocklist
+3. Max positions (3)
+4. Max total exposure (25% of equity)
+5. Max position value ($1,000)
+6. Max executions per day (2)
+7. Daily loss limit (5% of equity)
+8. Weekly loss limit (10% of equity)
 9. IV rank cap (70%)
 10. Minimum DTE (6)
 11. Max bid-ask spread (15%)
 12. Earnings blackout (2 days)
-13. Market timing (15 min buffer at open/close)
-14. All blocks logged with `safety_gate_blocked` event
+13. Market timing (15 min buffer before market close; no open delay by default)
+
+> **Note:** Consecutive losses are handled exclusively by the circuit breaker (120-min cooldown), NOT the safety gate. A duplicate check here previously caused a permanent deadlock — the gate blocked all entries, which meant no new trades could clear the loss counter, freezing the system indefinitely.
 
 ### Circuit Breakers (`core/circuit_breaker.py`)
 
@@ -252,6 +255,29 @@ Blocked from trading (hedging noise, low signal-to-noise):
 
 ## Monitoring & Observability
 
+### Position Reconciliation (`core/reconciler.py`)
+
+Runs every 5th monitor cycle (~60 seconds). Compares Alpaca broker positions against the local SQLite database and fixes discrepancies:
+
+- **Phantoms** (in DB but not in broker): Position closed at broker without DB knowing (manual close, stop fill, etc.)
+- **Orphans** (in broker but not in DB): Position exists at broker with no DB record (manual trade, restart data loss, etc.)
+- **Price drift**: >10% discrepancy between broker and DB prices
+
+**Safety guards before phantom closure:**
+
+1. **TradeLog check** — if `execute_exit()` already closed this position (TradeLog exists), just flip status without creating a duplicate trade record
+2. **Pending exit intent** — if an exit order is in flight (`OrderIntent` with status=PENDING), don't phantom-close; the order reconciler will handle the fill
+3. **Working sell order** — if a SELL order is submitted/pending at the broker (`BrokerOrder`), the position may briefly vanish from `get_positions()` during fill; wait for it
+
+**Safety guards before orphan adoption:**
+
+4. **Same-cycle block** — symbols phantom-closed in this cycle are not re-adopted as orphans
+5. **Recently-closed block** — symbols closed within the last 30 minutes are not re-adopted (prevents phantom→orphan→phantom death spiral)
+
+**Broker-aware position queries:**
+
+`get_open_positions()` fetches broker data every cycle and flags positions missing from the broker (`broker_missing: true`). The monitor loop skips exit trigger evaluation and Claude decisions for broker-missing positions — only the reconciler handles their cleanup.
+
 ### Structured Logging
 
 Three output streams via structlog:
@@ -273,23 +299,42 @@ Run every 30 minutes, alert on 3+ consecutive failures:
 
 ### Telegram Bot
 
-13+ interactive commands (auth-gated to admin only):
+15 interactive commands (auth-gated to admin only):
 
 ```
 /health        - Run health checks
-/status        - Mode, uptime, scan count
-/positions     - Open positions with P&L
+/status        - Mode, uptime, scan count, circuit breaker state
+/positions     - Open positions with P&L, DTE
 /orders        - Pending broker orders
-/risk          - Portfolio risk score
-/performance   - 30-day metrics (win rate, Sharpe, etc.)
-/weekly        - 7-day report
-/history       - Last 10 trades
+/expirations   - DTE alerts for open positions
+/risk          - Portfolio risk score breakdown
+/performance   - 30-day metrics (win rate, Sharpe, drawdown)
+/weekly        - 7-day performance report
+/history       - Last 10 trades with P&L
 /flow          - Manual scan trigger
-/close <id>    - Close position by ID
+/close <id>    - Close position by ID or ticker
 /reconcile     - Sync positions with broker
 /killswitch    - Toggle kill switch
 /errors        - Last 10 error log entries
+/help          - List available commands
 ```
+
+## Source of Truth Architecture
+
+**Alpaca broker is the source of truth for all position state.** The database is a journal for logging, trade history, and metadata enrichment (Greeks, conviction, thesis).
+
+Every decision-making code path — safety gate, risk scoring, position sizing, exit triggers, Claude context — queries the broker first. The DB is only consulted for metadata the broker doesn't track (Greeks, entry thesis, conviction scores).
+
+| Decision | Source | DB Role |
+|----------|--------|---------|
+| Position count (max_positions gate) | Broker `get_positions()` | Not used |
+| Exposure calculation (max_exposure gate) | Broker `get_positions()` | Not used |
+| Position sizing (remaining capacity) | Broker `get_positions()` | Not used |
+| Risk scoring (delta/gamma/theta) | Broker positions | Greeks enrichment |
+| Exit trigger evaluation | Broker positions | Greeks/conviction enrichment |
+| Claude entry/exit context | Broker positions | Thesis enrichment |
+| Trade history / P&L ledger | Not applicable | DB is primary |
+| Circuit breakers (loss limits) | Not applicable | DB TradeLog is primary |
 
 ## Database
 
@@ -327,13 +372,17 @@ mypy .
 
 ## Dependencies
 
-| Package            | Purpose                    |
-|--------------------|----------------------------|
-| anthropic          | Claude API (agent SDK)     |
-| alpaca-py          | Broker (orders, account)   |
-| pydantic-settings  | Validated configuration    |
-| sqlalchemy         | ORM + database             |
-| httpx              | Async HTTP client          |
-| structlog          | Structured logging         |
-| pytz               | Timezone handling          |
-| aiohttp            | Telegram bot long-polling  |
+| Package            | Purpose                              |
+|--------------------|--------------------------------------|
+| anthropic          | Claude API (agent SDK)               |
+| alpaca-py          | Broker (orders, account, data)       |
+| pydantic-settings  | Validated configuration              |
+| sqlalchemy         | ORM + database                       |
+| alembic            | Database migrations                  |
+| httpx              | Async HTTP client                    |
+| structlog          | Structured logging                   |
+| pytz               | Timezone handling                    |
+| aiohttp            | Telegram bot long-polling            |
+| websockets         | WebSocket support                    |
+| python-dotenv      | `.env` file loading                  |
+| yfinance           | Earnings date lookups (fallback)     |

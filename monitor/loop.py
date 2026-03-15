@@ -22,7 +22,7 @@ from core.circuit_breaker import get_trading_breaker
 from core.health import get_health_checker
 from core.killswitch import is_killed
 from core.logger import bind_cycle_id, get_logger
-from data.models import PositionRecord, PositionStatus, TradeLog, get_session
+from data.models import TradeLog, get_session
 from services.alpaca_broker import get_broker
 from core.utils import TZ
 from services.telegram import TelegramNotifier
@@ -214,6 +214,7 @@ class MonitorLoop:
             positions = get_open_positions()
 
             # Step 6: Check exit triggers on open positions
+            # All positions are broker-confirmed (get_open_positions is broker-first)
             triggered: list[tuple[dict, dict]] = []
             for pos in positions:
                 trigger_result = check_exit_triggers(pos)
@@ -450,11 +451,10 @@ class MonitorLoop:
             )
             total_pnl = sum(t.pnl_dollars for t in trades)
 
-            open_count = (
-                session.query(PositionRecord)
-                .filter(PositionRecord.status == PositionStatus.OPEN)
-                .count()
-            )
+            try:
+                open_count = len(self._broker.get_positions())
+            except Exception:
+                open_count = 0
 
             perf = get_performance_summary(30)
 
@@ -519,14 +519,11 @@ class MonitorLoop:
         base_interval = self.settings.monitor.poll_interval_seconds
 
         # Halve poll interval when open positions exist for more frequent
-        # exit trigger, P&L, and risk checks
-        session = get_session()
+        # exit trigger, P&L, and risk checks — broker is source of truth
         try:
-            has_open = session.query(PositionRecord).filter(
-                PositionRecord.status == PositionStatus.OPEN
-            ).first() is not None
-        finally:
-            session.close()
+            has_open = len(self._broker.get_positions()) > 0
+        except Exception:
+            has_open = False
 
         if has_open:
             return base_interval // 2

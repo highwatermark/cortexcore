@@ -60,7 +60,10 @@ class TradingCircuitBreaker:
             now = trading_now()
             trades = (
                 session.query(TradeLog)
-                .filter(TradeLog.closed_at >= today)
+                .filter(
+                    TradeLog.closed_at >= today,
+                    TradeLog.exit_reason != "phantom_closure_reconciler",
+                )
                 .all()
             )
             total_loss = sum(t.pnl_dollars for t in trades if t.pnl_dollars < 0)
@@ -87,7 +90,10 @@ class TradingCircuitBreaker:
             monday = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
             trades = (
                 session.query(TradeLog)
-                .filter(TradeLog.closed_at >= monday)
+                .filter(
+                    TradeLog.closed_at >= monday,
+                    TradeLog.exit_reason != "phantom_closure_reconciler",
+                )
                 .all()
             )
             total_loss = sum(t.pnl_dollars for t in trades if t.pnl_dollars < 0)
@@ -113,6 +119,7 @@ class TradingCircuitBreaker:
         try:
             recent = (
                 session.query(TradeLog)
+                .filter(TradeLog.exit_reason != "phantom_closure_reconciler")
                 .order_by(TradeLog.closed_at.desc())
                 .limit(max_consecutive)
                 .all()

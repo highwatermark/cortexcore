@@ -25,7 +25,10 @@ def _get_trades(days: int = 30) -> list[TradeLog]:
         cutoff = (trading_now() - timedelta(days=days)).strftime("%Y-%m-%d")
         return (
             session.query(TradeLog)
-            .filter(TradeLog.closed_at >= cutoff)
+            .filter(
+                TradeLog.closed_at >= cutoff,
+                TradeLog.exit_reason != "phantom_closure_reconciler",
+            )
             .order_by(TradeLog.closed_at.asc())
             .all()
         )

@@ -203,10 +203,10 @@ Before any code changes, these are the authoritative values. Any deviation is a 
 
 ### 3.1 Full Position Reconciliation
 - **Priority:** P1
-- **Status:** [ ] Pending
-- **Files:** NEW `core/reconciler.py`, modify `monitor/loop.py`
+- **Status:** [x] Done (hardened 2026-03-02)
+- **Files:** `core/reconciler.py`, `tools/position_tools.py`, `monitor/loop.py`
 - **Design:**
-  - Run every N cycles (e.g., every 5th cycle) during market hours
+  - Run every 5th cycle (~60 seconds) during market hours
   - Fetch all positions from Alpaca broker
   - Fetch all OPEN positions from PositionRecord table
   - Compare:
@@ -214,6 +214,16 @@ Before any code changes, these are the authoritative values. Any deviation is a 
     - **Phantoms** (in DB, not in Alpaca): Mark as CLOSED in DB, alert operator
     - **Price drift** (>10% discrepancy): Update DB, log warning
   - Log every reconciliation run with counts
+  - **Safety guards (added 2026-03-02 to fix phantom→orphan death spiral):**
+    - Before phantom closure: check for existing TradeLog (already closed by execute_exit)
+    - Before phantom closure: check for pending exit OrderIntent (exit in flight)
+    - Before phantom closure: check for working SELL BrokerOrder (fill in progress)
+    - Before orphan adoption: block re-adoption of symbols phantom-closed in same cycle
+    - Before orphan adoption: block re-adoption of symbols closed within last 30 minutes
+  - **Broker-aware position queries (added 2026-03-02):**
+    - `get_open_positions()` flags positions missing from broker (`broker_missing: true`)
+    - Monitor loop skips exit triggers and Claude decisions for broker-missing positions
+    - Only reconciler handles phantom position cleanup
 - **Test:** Insert phantom position in DB (no matching Alpaca position), verify it gets flagged. Mock orphan in Alpaca response, verify it gets adopted.
 
 ### 3.2 Health Check System

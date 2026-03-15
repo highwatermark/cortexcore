@@ -34,9 +34,20 @@ def _base_signal(**overrides) -> dict:
     return sig
 
 
-def _mock_broker_account(equity=100_000):
+def _mock_broker_position(entry_price=3.0, quantity=1, ticker="AAPL"):
+    pos = MagicMock()
+    pos.entry_price = entry_price
+    pos.quantity = quantity
+    pos.ticker = ticker
+    pos.option_symbol = f"{ticker}260320C00200000"
+    pos.current_price = entry_price
+    return pos
+
+
+def _mock_broker_account(equity=100_000, positions=None):
     mock = MagicMock()
     mock.get_account.return_value = {"equity": equity}
+    mock.get_positions.return_value = positions or []
     return mock
 
 
@@ -62,39 +73,25 @@ class TestSafetyGate:
         allowed, reason = gate.check_entry(_base_signal(ticker="GME"))
         assert allowed is False
 
-    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
-    def test_max_positions_blocked(self, mock_broker) -> None:
-        session = get_session()
-        for i in range(3):
-            session.add(PositionRecord(
-                position_id=f"pos-{i}", signal_id=f"sig-{i}", ticker="AAPL",
-                option_symbol=f"AAPL{i}", action=SignalAction.CALL,
-                strike=200, expiration="2026-03-20", quantity=1,
-                entry_price=3.0, entry_value=300, status=PositionStatus.OPEN,
-            ))
-        session.commit()
-        session.close()
+    @patch("services.alpaca_broker.get_broker")
+    def test_max_positions_blocked(self, mock_get_broker) -> None:
+        # 3 positions at broker → at max (max_positions=3)
+        broker_positions = [_mock_broker_position(ticker=f"T{i}") for i in range(3)]
+        mock_get_broker.return_value = _mock_broker_account(positions=broker_positions)
 
         gate = SafetyGate()
         allowed, reason = gate.check_entry(_base_signal())
         assert allowed is False
         assert "Max positions" in reason
 
-    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account(equity=5000))
-    def test_max_exposure_blocked(self, mock_broker) -> None:
-        session = get_session()
-        session.add(PositionRecord(
-            position_id="pos-1", signal_id="sig-1", ticker="NVDA",
-            option_symbol="NVDA1", action=SignalAction.CALL,
-            strike=200, expiration="2026-03-20", quantity=1,
-            entry_price=10.0, entry_value=1000, status=PositionStatus.OPEN,
-        ))
-        session.commit()
-        session.close()
+    @patch("services.alpaca_broker.get_broker")
+    def test_max_exposure_blocked(self, mock_get_broker) -> None:
+        # 1 position at broker with $10 entry → $1000 exposure
+        # On $5K equity + proposed $350 → 27% > 25% limit
+        broker_positions = [_mock_broker_position(entry_price=10.0, quantity=1, ticker="NVDA")]
+        mock_get_broker.return_value = _mock_broker_account(equity=5000, positions=broker_positions)
 
         gate = SafetyGate()
-        # Trying to add $350 (1 contract * $3.50 * 100) to $1000 existing = $1350
-        # On $5K equity that's 27% > 25% limit
         allowed, reason = gate.check_entry(_base_signal())
         assert allowed is False
         assert "exposure" in reason.lower()
@@ -145,7 +142,11 @@ class TestSafetyGate:
         assert "Daily loss" in reason
 
     @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
-    def test_consecutive_losses_blocked(self, mock_broker) -> None:
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_consecutive_losses_not_blocked_in_safety_gate(self, mock_timing, mock_broker) -> None:
+        """Consecutive losses are handled by circuit_breaker.py (with cooldown),
+        NOT by the safety gate.  A duplicate check here previously caused a
+        permanent deadlock — no new trades → no winning trade → never clears."""
         session = get_session()
         for i in range(2):
             session.add(TradeLog(
@@ -159,8 +160,7 @@ class TestSafetyGate:
 
         gate = SafetyGate()
         allowed, reason = gate.check_entry(_base_signal())
-        assert allowed is False
-        assert "losses" in reason.lower()
+        assert allowed is True
 
     @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
     @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))

@@ -20,6 +20,7 @@ dependencies = [
     "structlog>=24.1",
     "aiohttp>=3.9",
     "python-dotenv>=1.0",
+    "yfinance>=0.2",
 ]
 
 [project.optional-dependencies]

@@ -15,8 +15,6 @@ from core.utils import TZ
 from data.models import (
     IntentStatus,
     OrderIntent,
-    PositionRecord,
-    PositionStatus,
     TradeLog,
     get_session,
 )
@@ -48,7 +46,10 @@ class SafetyGate:
             self._check_max_executions_today,
             self._check_daily_loss_limit,
             self._check_weekly_loss_limit,
-            self._check_consecutive_losses,
+            # NOTE: consecutive losses handled ONLY by circuit_breaker.py (with
+            # 120-min cooldown).  A duplicate check here created a permanent
+            # deadlock — no new trades meant no winning trade to clear the
+            # counter, so the gate blocked forever.  Removed 2026-03-14.
             self._check_iv_rank,
             self._check_dte,
             self._check_spread,
@@ -62,11 +63,11 @@ class SafetyGate:
                 log.warning("safety_gate_blocked", check=check_fn.__name__, reason=reason, ticker=signal.get("ticker", ""))
                 return False, reason
 
-        session = get_session()
+        from services.alpaca_broker import get_broker
         try:
-            _pos_count = session.query(PositionRecord).filter(PositionRecord.status == PositionStatus.OPEN).count()
-        finally:
-            session.close()
+            _pos_count = len(get_broker().get_positions())
+        except Exception:
+            _pos_count = -1
         log.info(
             "safety_gate_passed",
             ticker=signal.get("ticker", ""),
@@ -91,55 +92,50 @@ class SafetyGate:
 
     def _check_max_positions(self, signal: dict) -> tuple[bool, str]:
         max_pos = self._settings.trading.max_positions
-        session = get_session()
+        from services.alpaca_broker import get_broker
         try:
-            count = (
-                session.query(PositionRecord)
-                .filter(PositionRecord.status == PositionStatus.OPEN)
-                .count()
-            )
-            if count >= max_pos:
-                return False, f"Max positions reached: {count}/{max_pos}"
-            return True, ""
-        finally:
-            session.close()
+            count = len(get_broker().get_positions())
+        except Exception:
+            return False, "Cannot verify positions — broker unreachable"
+        if count >= max_pos:
+            return False, f"Max positions reached: {count}/{max_pos}"
+        return True, ""
 
     def _check_max_exposure(self, signal: dict) -> tuple[bool, str]:
-        """Check total exposure as % of account equity."""
+        """Check total exposure as % of account equity. Broker is source of truth."""
         max_pct = self._settings.trading.max_total_exposure_pct
-        session = get_session()
+
+        from services.alpaca_broker import get_broker
+        broker = get_broker()
         try:
-            positions = (
-                session.query(PositionRecord)
-                .filter(PositionRecord.status == PositionStatus.OPEN)
-                .all()
-            )
-            total_exposure = sum((p.entry_value or 0) for p in positions)
+            account = broker.get_account()
+            equity = account.get("equity", 0)
+        except Exception:
+            return False, "Cannot verify equity — broker unreachable"
 
-            # Add proposed trade value
-            qty = signal.get("quantity", 1)
-            price = signal.get("limit_price", 0)
-            proposed_value = qty * price * 100  # options multiplier
+        if equity <= 0:
+            return False, "Cannot verify equity — broker returned zero"
 
-            from services.alpaca_broker import get_broker
-            try:
-                account = get_broker().get_account()
-                equity = account.get("equity", 0)
-            except Exception:
-                return False, "Cannot verify equity — broker unreachable"
+        # Broker positions are the real exposure
+        try:
+            broker_positions = broker.get_positions()
+        except Exception:
+            return False, "Cannot verify positions — broker unreachable"
 
-            if equity <= 0:
-                return False, "Cannot verify equity — broker returned zero"
+        total_exposure = sum(bp.entry_price * bp.quantity * 100 for bp in broker_positions)
 
-            new_total = total_exposure + proposed_value
-            exposure_pct = new_total / equity if equity > 0 else 1.0
+        # Add proposed trade value
+        qty = signal.get("quantity", 1)
+        price = signal.get("limit_price", 0)
+        proposed_value = qty * price * 100  # options multiplier
 
-            if exposure_pct > max_pct:
-                return False, f"Total exposure {exposure_pct:.0%} would exceed {max_pct:.0%} limit"
-            log.debug("exposure_check_passed", exposure_pct=f"{exposure_pct:.1%}", max_pct=f"{max_pct:.0%}", current_exposure=total_exposure, proposed=proposed_value)
-            return True, ""
-        finally:
-            session.close()
+        new_total = total_exposure + proposed_value
+        exposure_pct = new_total / equity if equity > 0 else 1.0
+
+        if exposure_pct > max_pct:
+            return False, f"Total exposure {exposure_pct:.0%} would exceed {max_pct:.0%} limit"
+        log.debug("exposure_check_passed", exposure_pct=f"{exposure_pct:.1%}", max_pct=f"{max_pct:.0%}", current_exposure=total_exposure, proposed=proposed_value)
+        return True, ""
 
     def _check_max_position_value(self, signal: dict) -> tuple[bool, str]:
         max_val = self._settings.trading.max_position_value
@@ -229,26 +225,6 @@ class SafetyGate:
             if loss_pct >= max_loss_pct:
                 return False, f"Weekly loss {loss_pct:.1%} >= {max_loss_pct:.0%} limit"
             log.debug("weekly_loss_check_passed", loss_pct=f"{loss_pct:.1%}", max_pct=f"{max_loss_pct:.0%}", total_loss=total_loss)
-            return True, ""
-        finally:
-            session.close()
-
-    def _check_consecutive_losses(self, signal: dict) -> tuple[bool, str]:
-        max_consecutive = self._settings.monitor.max_consecutive_losses
-        session = get_session()
-        try:
-            recent_trades = (
-                session.query(TradeLog)
-                .order_by(TradeLog.closed_at.desc())
-                .limit(max_consecutive)
-                .all()
-            )
-            if len(recent_trades) < max_consecutive:
-                return True, ""
-
-            all_losses = all(t.pnl_dollars < 0 for t in recent_trades)
-            if all_losses:
-                return False, f"Last {max_consecutive} trades are all losses — cooling off"
             return True, ""
         finally:
             session.close()
