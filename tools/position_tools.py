@@ -101,7 +101,7 @@ def get_open_positions() -> list[dict]:
             "gamma": db_pos.gamma or 0 if db_pos else 0,
             "theta": db_pos.theta or 0 if db_pos else 0,
             "vega": db_pos.vega or 0 if db_pos else 0,
-            "conviction": db_pos.conviction if db_pos else 0,
+            "conviction": db_pos.conviction if db_pos else 75,
             "dte_remaining": bp.dte_remaining,
             "entry_thesis": db_pos.entry_thesis if db_pos else "",
             "in_db": db_pos is not None,

@@ -253,3 +253,28 @@ class TestAbandonedPositionFiltering:
         assert results[0]["ticker"] == "AAPL"
         # ARRY should be filtered out
         assert not any(r["ticker"] == "ARRY" for r in results)
+
+
+class TestOrphanConviction:
+    @patch("tools.position_tools.AlpacaBroker")
+    def test_orphan_position_gets_default_conviction_75(self, mock_broker_cls) -> None:
+        """Positions without DB records should get conviction=75, not 0."""
+        init_db(":memory:")
+        mock_pos = MagicMock()
+        mock_pos.ticker = "AAPL"
+        mock_pos.option_symbol = "AAPL260320C00200000"
+        mock_pos.action = SignalAction.CALL
+        mock_pos.strike = 200.0
+        mock_pos.expiration = "2026-03-20"
+        mock_pos.quantity = 2
+        mock_pos.entry_price = 3.50
+        mock_pos.current_price = 3.80
+        mock_pos.pnl_pct = 8.57
+        mock_pos.pnl_dollars = 60.0
+        mock_pos.dte_remaining = 15
+        mock_pos.position_id = "orphan-123"
+        mock_broker_cls.return_value.get_positions.return_value = [mock_pos]
+
+        positions = get_open_positions()
+        assert len(positions) == 1
+        assert positions[0]["conviction"] == 75
