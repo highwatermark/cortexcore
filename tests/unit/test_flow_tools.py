@@ -295,3 +295,18 @@ class TestSaveSignal:
 
         signal_id = save_signal(signal, score_result)
         assert signal_id == "save-test-1"
+
+
+class TestSignalEnrichment:
+    def test_signal_with_bid_ask_flows_to_scoring(self) -> None:
+        """Signals with bid/ask populated should carry those values through to dict."""
+        from data.models import FlowSignal, SignalAction
+        sig = FlowSignal(
+            ticker="AAPL", action=SignalAction.CALL, strike=200.0,
+            expiration="2026-04-17", premium=150000, volume=500,
+            open_interest=300, vol_oi_ratio=1.67, option_type="CALL",
+            bid=2.00, ask=3.00,
+        )
+        d = sig.model_dump()
+        assert d["bid"] == 2.00
+        assert d["ask"] == 3.00

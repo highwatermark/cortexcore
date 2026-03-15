@@ -204,6 +204,12 @@ class UnusualWhalesClient:
                             # Use raw IV as proxy (0-1 scale → 0-100 percentage)
                             sig.iv_rank = round(snap["iv"] * 100, 1)
                             enriched += 1
+                        # Populate bid/ask for spread gate (from Alpaca snapshot)
+                        if snap:
+                            if snap.get("bid") is not None:
+                                sig.bid = snap["bid"]
+                            if snap.get("ask") is not None:
+                                sig.ask = snap["ask"]
                     log.info("iv_enrichment", total=len(signals), enriched=enriched)
             except Exception as e:
                 log.warning("iv_enrichment_failed", error=str(e))

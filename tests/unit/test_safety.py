@@ -205,6 +205,23 @@ class TestSafetyGate:
 
     @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
     @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_spread_gate_blocks_wide_spread_from_enrichment(self, mock_timing, mock_broker) -> None:
+        """Signals enriched with bid/ask from Alpaca snapshot should be blocked by spread gate."""
+        gate = SafetyGate()
+        allowed, reason = gate.check_entry(_base_signal(bid=2.00, ask=3.00))
+        assert allowed is False
+        assert "Spread" in reason
+
+    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_spread_gate_passes_tight_spread(self, mock_timing, mock_broker) -> None:
+        """Signals with tight bid/ask spread should pass the spread gate."""
+        gate = SafetyGate()
+        allowed, reason = gate.check_entry(_base_signal(bid=3.45, ask=3.55))
+        assert allowed is True
+
+    @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
     def test_earnings_blackout_blocked(self, mock_timing, mock_broker) -> None:
         gate = SafetyGate()
         # Earnings tomorrow — within 2-day blackout
