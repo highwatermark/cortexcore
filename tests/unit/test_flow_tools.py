@@ -297,6 +297,67 @@ class TestSaveSignal:
         assert signal_id == "save-test-1"
 
 
+class TestSignalDedup:
+    def setup_method(self) -> None:
+        """Reset module-level dedup state between tests."""
+        from tools import flow_tools
+        flow_tools._seen_contracts.clear()
+        flow_tools._seen_date = ""
+
+    def test_rejected_signal_can_be_rescored(self) -> None:
+        """A signal that was scanned but not accepted should be eligible for rescore."""
+        from tools.flow_tools import _seen_contracts, _contract_key, mark_signal_accepted
+        from data.models import FlowSignal, SignalAction
+
+        sig = FlowSignal(
+            ticker="AAPL", action=SignalAction.CALL, strike=200.0,
+            expiration="2026-04-17", premium=150000, volume=500,
+            open_interest=300, vol_oi_ratio=1.67, option_type="CALL",
+        )
+        key = _contract_key(sig)
+
+        # Simulate scan_flow processing — seen but not accepted
+        _seen_contracts[key] = {"premium": sig.premium, "accepted": False}
+
+        entry = _seen_contracts.get(key)
+        assert entry is not None
+        assert entry["accepted"] is False
+
+    def test_accepted_signal_blocked_on_rescan(self) -> None:
+        """A signal that was accepted should be blocked on rescan (same premium)."""
+        from tools.flow_tools import _seen_contracts, mark_signal_accepted
+        from data.models import FlowSignal, SignalAction
+
+        sig = FlowSignal(
+            ticker="AAPL", action=SignalAction.CALL, strike=200.0,
+            expiration="2026-04-17", premium=150000, volume=500,
+            open_interest=300, vol_oi_ratio=1.67, option_type="CALL",
+        )
+
+        mark_signal_accepted(sig.model_dump())
+
+        key = f"AAPL:CALL:200.0:2026-04-17"
+        entry = _seen_contracts.get(key)
+        assert entry is not None
+        assert entry["accepted"] is True
+
+    def test_higher_premium_allows_rescore_even_if_accepted(self) -> None:
+        """Higher premium should allow rescore even if previously accepted."""
+        from tools.flow_tools import _seen_contracts, mark_signal_accepted
+        from data.models import FlowSignal, SignalAction
+
+        sig = FlowSignal(
+            ticker="AAPL", action=SignalAction.CALL, strike=200.0,
+            expiration="2026-04-17", premium=150000, volume=500,
+            open_interest=300, vol_oi_ratio=1.67, option_type="CALL",
+        )
+        mark_signal_accepted(sig.model_dump())
+
+        key = f"AAPL:CALL:200.0:2026-04-17"
+        entry = _seen_contracts[key]
+        assert 200000 > entry["premium"]
+
+
 class TestSignalEnrichment:
     def test_signal_with_bid_ask_flows_to_scoring(self) -> None:
         """Signals with bid/ask populated should carry those values through to dict."""

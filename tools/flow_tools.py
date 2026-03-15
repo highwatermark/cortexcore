@@ -23,7 +23,8 @@ _scan_scored_signals: list[tuple[dict, dict]] = []  # (signal, score_result)
 # skip re-scoring unless the new signal has higher premium (indicating a
 # bigger institutional bet that could score higher).
 # Keyed by "TICKER:TYPE:STRIKE:EXPIRATION" → best premium, resets each trading day.
-_seen_contracts: dict[str, float] = {}
+_seen_contracts: dict[str, dict] = {}
+# Each value: {"premium": float, "accepted": bool}
 _seen_date: str = ""  # YYYY-MM-DD in PT, used to reset daily
 
 
@@ -58,20 +59,25 @@ async def scan_flow() -> list[dict]:
     skipped = 0
     for sig in signals[: get_settings().flow.max_analyze]:
         key = _contract_key(sig)
-        prev_premium = _seen_contracts.get(key)
-        if prev_premium is not None and sig.premium <= prev_premium:
-            # Already scored with equal or higher premium — skip
-            skipped += 1
-            continue
-        # New contract or higher premium — allow rescoring
-        if prev_premium is not None:
-            log.info(
-                "rescore_premium_increase",
-                contract=key,
-                old_premium=prev_premium,
-                new_premium=sig.premium,
-            )
-        _seen_contracts[key] = sig.premium
+        prev = _seen_contracts.get(key)
+        if prev is not None:
+            if prev["accepted"] and sig.premium <= prev["premium"]:
+                # Already accepted with equal or higher premium — skip
+                skipped += 1
+                continue
+            elif not prev["accepted"] and sig.premium <= prev["premium"]:
+                # Previously rejected but not yet accepted — allow rescore
+                pass
+            elif sig.premium > prev["premium"]:
+                # Higher premium — allow rescore regardless
+                log.info(
+                    "rescore_premium_increase",
+                    contract=key,
+                    old_premium=prev["premium"],
+                    new_premium=sig.premium,
+                )
+        # Record as seen but not yet accepted
+        _seen_contracts[key] = {"premium": sig.premium, "accepted": False}
         results.append(sig.model_dump())
 
     log.info(
@@ -81,6 +87,20 @@ async def scan_flow() -> list[dict]:
         seen_total=len(_seen_contracts),
     )
     return results
+
+
+def mark_signal_accepted(signal: dict) -> None:
+    """Mark a signal's contract as accepted (passed all checks).
+
+    Called from the monitor loop after a signal passes pre-trade checks.
+    Accepted signals are blocked from rescore on subsequent cycles.
+    """
+    key = f"{signal.get('ticker', '')}:{signal.get('option_type', '')}:{signal.get('strike', 0)}:{signal.get('expiration', '')}"
+    entry = _seen_contracts.get(key)
+    if entry:
+        entry["accepted"] = True
+    else:
+        _seen_contracts[key] = {"premium": signal.get("premium", 0), "accepted": True}
 
 
 def score_signal(signal: dict) -> dict:

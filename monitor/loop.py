@@ -28,7 +28,7 @@ from core.utils import TZ
 from services.telegram import TelegramNotifier
 from core.reconciler import reconcile_positions
 from tools.execution_tools import execute_exit, reconcile_orders
-from tools.flow_tools import scan_flow, score_signal, save_signal, send_scan_report
+from tools.flow_tools import scan_flow, score_signal, save_signal, send_scan_report, mark_signal_accepted
 from tools.position_tools import get_open_positions, check_exit_triggers, refresh_positions
 from tools.risk_tools import calculate_portfolio_risk, pre_trade_check
 
@@ -229,6 +229,8 @@ class MonitorLoop:
                 ptc = pre_trade_check({**sig, "score": score_result.get("score", 0)}, risk_assessment)
                 if ptc.get("approved"):
                     passing.append((sig, score_result, ptc))
+                    # Mark signal as accepted so it won't be rescored
+                    mark_signal_accepted(sig)
                 else:
                     log.info("pre_trade_denied", ticker=sig.get("ticker"), reasons=ptc.get("reasons"))
 
