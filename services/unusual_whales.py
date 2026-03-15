@@ -201,8 +201,13 @@ class UnusualWhalesClient:
                     for sig in signals:
                         snap = snapshots.get(sig.option_symbol)
                         if snap and snap.get("iv") is not None:
-                            # Use raw IV as proxy (0-1 scale → 0-100 percentage)
-                            sig.iv_rank = round(snap["iv"] * 100, 1)
+                            raw_iv = snap["iv"]
+                            try:
+                                iv_rank = get_options_data_client().compute_iv_rank(sig.ticker, raw_iv)
+                                sig.iv_rank = iv_rank
+                            except Exception as e_ivr:
+                                log.warning("iv_rank_compute_failed", ticker=sig.ticker, error=str(e_ivr))
+                                sig.iv_rank = 0.0  # fail-open
                             enriched += 1
                         # Populate bid/ask for spread gate (from Alpaca snapshot)
                         if snap:

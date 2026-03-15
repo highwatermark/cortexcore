@@ -5,10 +5,14 @@ Wraps alpaca-py OptionHistoricalDataClient for snapshot queries.
 """
 from __future__ import annotations
 
+import math
+from datetime import date, timedelta
+
 import yfinance as yf
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import OptionSnapshotRequest, StockSnapshotRequest
+from alpaca.data.requests import OptionSnapshotRequest, StockBarsRequest, StockSnapshotRequest
+from alpaca.data.timeframe import TimeFrame
 
 from config.settings import get_settings
 from core.logger import get_logger
@@ -36,6 +40,7 @@ class AlpacaOptionsData:
             secret_key=self._settings.api.alpaca_secret_key,
         )
         self._stock_client: StockHistoricalDataClient | None = None
+        self._iv_rank_cache: dict[str, dict] = {}
 
     def _get_stock_client(self) -> StockHistoricalDataClient:
         if self._stock_client is None:
@@ -98,6 +103,71 @@ class AlpacaOptionsData:
 
         log.info("snapshots_fetched", requested=len(symbols), returned=len(results))
         return results
+
+    def _fetch_historical_bars(self, ticker: str, days: int = 365) -> list:
+        """Fetch daily bars for a stock over the past N calendar days."""
+        client = self._get_stock_client()
+        end = date.today()
+        start = end - timedelta(days=days)
+        try:
+            request = StockBarsRequest(
+                symbol_or_symbols=ticker,
+                timeframe=TimeFrame.Day,
+                start=start.isoformat(),
+                end=end.isoformat(),
+            )
+            bars = client.get_stock_bars(request)
+            return list(bars[ticker]) if ticker in bars else []
+        except Exception as e:
+            log.warning("historical_bars_failed", ticker=ticker, error=str(e))
+            return []
+
+    def compute_iv_rank(self, ticker: str, current_iv: float) -> float:
+        """Compute IV rank as percentile of current IV vs 52-week realized vol.
+
+        Returns 0-100 where 80 means current IV is higher than 80% of
+        the historical realized volatility distribution.
+        Returns 0.0 if insufficient data (fail-open: allows trade).
+        """
+        today_str = date.today().isoformat()
+
+        # Check cache
+        cached = self._iv_rank_cache.get(ticker)
+        if cached and cached.get("date") == today_str and cached.get("vol_distribution"):
+            vol_dist = cached["vol_distribution"]
+        else:
+            # Fetch and compute
+            bars = self._fetch_historical_bars(ticker, days=365)
+            if len(bars) < 60:
+                log.info("iv_rank_insufficient_data", ticker=ticker, bars=len(bars))
+                return 0.0
+
+            # Compute 30-day rolling realized vol (annualized)
+            closes = [b.close for b in bars]
+            log_returns = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+            vol_dist = []
+            window = 30
+            for i in range(window, len(log_returns)):
+                window_returns = log_returns[i - window:i]
+                daily_vol = (sum(r ** 2 for r in window_returns) / window) ** 0.5
+                annual_vol = daily_vol * math.sqrt(252)
+                vol_dist.append(round(annual_vol, 4))
+
+            if not vol_dist:
+                return 0.0
+
+            # Cache for today
+            self._iv_rank_cache[ticker] = {
+                "date": today_str,
+                "vol_distribution": vol_dist,
+            }
+
+        # Percentile rank
+        below = sum(1 for v in vol_dist if v < current_iv)
+        rank = (below / len(vol_dist)) * 100
+        log.info("iv_rank_computed", ticker=ticker, current_iv=round(current_iv, 4),
+                 rank=round(rank, 1), distribution_size=len(vol_dist))
+        return round(rank, 1)
 
     def get_market_context(self) -> dict:
         """Fetch VIX index and SPY market context for Claude decisions.
