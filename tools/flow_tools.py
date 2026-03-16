@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, date, timezone
 
-from config.settings import get_settings
+from config.settings import TICKER_WEIGHTS, get_settings
 from core.utils import TZ
 from core.logger import get_logger
 from data.models import FlowSignal, SignalAction, SignalRecord, get_session
@@ -128,14 +128,18 @@ def score_signal(signal: dict) -> dict:
             "min_required": settings.flow.min_score,
         }
 
+    # --- Ticker penalty (autoresearch exclusions) ---
+    ticker = signal.get("ticker", "").upper()
+    ticker_penalty = TICKER_WEIGHTS.get(ticker, 0)
+    if ticker_penalty:
+        score += ticker_penalty
+        breakdown.append(f"ticker_{ticker}:{ticker_penalty:+d}")
+
     # --- Reward indicators ---
     order_type = signal.get("order_type", "").lower()
     if "sweep" in order_type:
         score += 2
         breakdown.append("sweep:+2")
-    if "floor" in order_type:
-        score += 2
-        breakdown.append("floor:+2")
 
     # Opening position
     if signal.get("vol_oi_ratio", 0) >= 1.5:
@@ -148,11 +152,11 @@ def score_signal(signal: dict) -> dict:
     # Premium size
     premium = signal.get("premium", 0)
     if premium >= 500_000:
-        score += 2
-        breakdown.append("premium>=500K:+2")
+        score += 4
+        breakdown.append("premium>=500K:+4")
     elif premium >= 250_000:
-        score += 1
-        breakdown.append("premium>=250K:+1")
+        score += 2
+        breakdown.append("premium>=250K:+2")
 
     # Opening trade bonus
     if "open" in order_type:

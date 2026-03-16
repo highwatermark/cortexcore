@@ -6,7 +6,9 @@ Handles trade execution with idempotency, limit orders, fill polling, and notifi
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from config.settings import get_settings
@@ -33,6 +35,72 @@ log = get_logger("execution_tools")
 # Max time to wait for a fill before returning (seconds)
 FILL_POLL_TIMEOUT = 30
 FILL_POLL_INTERVAL = 3
+
+# Fill quality log path
+FILL_QUALITY_PATH = Path("data/fill_quality.jsonl")
+
+
+def _log_fill_quality(
+    action: str,
+    ticker: str,
+    option_symbol: str,
+    fill_price: float,
+    fill_quantity: int,
+    order_id: str,
+    signal_price_mid: float | None = None,
+    signal_time: str | None = None,
+    bid_at_fill: float | None = None,
+    ask_at_fill: float | None = None,
+    open_interest: int | None = None,
+    volume_at_signal: int | None = None,
+    score: int | None = None,
+) -> None:
+    """Append a fill quality record to data/fill_quality.jsonl."""
+    now = datetime.now(timezone.utc)
+
+    slippage_pct = None
+    if signal_price_mid and signal_price_mid > 0:
+        slippage_pct = round(abs(fill_price - signal_price_mid) / signal_price_mid, 4)
+
+    spread_pct = None
+    if bid_at_fill and ask_at_fill and ask_at_fill > 0:
+        spread_pct = round((ask_at_fill - bid_at_fill) / ask_at_fill, 4)
+
+    signal_to_fill_seconds = None
+    if signal_time:
+        try:
+            sig_dt = datetime.fromisoformat(signal_time.replace("Z", "+00:00"))
+            signal_to_fill_seconds = int((now - sig_dt).total_seconds())
+        except (ValueError, TypeError):
+            pass
+
+    record = {
+        "timestamp": now.isoformat(),
+        "action": action,
+        "ticker": ticker,
+        "signal_time": signal_time,
+        "signal_price_mid": signal_price_mid,
+        "fill_price": fill_price,
+        "slippage_pct": slippage_pct,
+        "signal_to_fill_seconds": signal_to_fill_seconds,
+        "bid_at_fill": bid_at_fill,
+        "ask_at_fill": ask_at_fill,
+        "spread_pct": spread_pct,
+        "option_symbol": option_symbol,
+        "open_interest": open_interest,
+        "volume_at_signal": volume_at_signal,
+        "score": score,
+        "order_id": order_id,
+        "fill_quantity": fill_quantity,
+    }
+
+    try:
+        FILL_QUALITY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with FILL_QUALITY_PATH.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+        log.info("fill_quality_logged", action=action, ticker=ticker, slippage_pct=slippage_pct)
+    except Exception as e:
+        log.warning("fill_quality_log_error", error=str(e))
 
 
 def calculate_position_size(option_price: float, equity: float | None = None) -> dict:
@@ -373,6 +441,32 @@ async def execute_entry(
             filled_price=filled_price,
             order_state=order_state,
         )
+
+        # Log fill quality for slippage validation
+        if filled_qty > 0 and filled_price:
+            # Fetch current bid/ask for spread context
+            entry_bid, entry_ask = None, None
+            try:
+                from services.alpaca_options_data import get_options_data_client
+                snap = get_options_data_client().get_snapshots([option_symbol]).get(option_symbol, {})
+                entry_bid = snap.get("bid")
+                entry_ask = snap.get("ask")
+            except Exception:
+                pass
+
+            _log_fill_quality(
+                action="entry",
+                ticker=ticker,
+                option_symbol=option_symbol,
+                fill_price=filled_price,
+                fill_quantity=filled_qty,
+                order_id=result.broker_order_id,
+                signal_price_mid=limit_price,
+                bid_at_fill=entry_bid,
+                ask_at_fill=entry_ask,
+                score=conviction,
+            )
+
         return {
             "success": True,
             "broker_order_id": result.broker_order_id,
@@ -673,6 +767,28 @@ async def execute_exit(
                 )
             except Exception as ne:
                 log.warning("notify_exit_failed", position_id=position_id, error=str(ne))
+
+            # Log fill quality for exit
+            exit_bid, exit_ask = None, None
+            try:
+                from services.alpaca_options_data import get_options_data_client
+                snap = get_options_data_client().get_snapshots([pos.option_symbol]).get(pos.option_symbol, {})
+                exit_bid = snap.get("bid")
+                exit_ask = snap.get("ask")
+            except Exception:
+                pass
+
+            _log_fill_quality(
+                action="exit",
+                ticker=pos.ticker,
+                option_symbol=pos.option_symbol,
+                fill_price=actual_exit_price,
+                fill_quantity=filled_qty if filled_qty > 0 else pos.quantity,
+                order_id=result.broker_order_id,
+                signal_price_mid=pos.current_price or pos.entry_price,
+                bid_at_fill=exit_bid,
+                ask_at_fill=exit_ask,
+            )
 
             log.info("exit_executed", position_id=position_id, ticker=pos.ticker, pnl=f"${pnl_dollars:.2f}", fill_price=actual_exit_price)
             return {

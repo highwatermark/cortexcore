@@ -55,14 +55,22 @@ The reconciler (`core/reconciler.py`) syncs DB with broker every 5 cycles. It ha
 
 ## Key Settings (Authoritative)
 
-- Max 3 concurrent positions, $1K max per position, 25% total exposure
-- Max 2 executions per day, 20% max per trade as % of equity
-- Profit targets: 40%/35%/25%/15% (adaptive by DTE >14/7-14/3-7/<3)
-- Stop loss: -35%, mandatory exit at DTE <= 5
-- Circuit breakers: 5% daily loss, 10% weekly loss, 2 consecutive losses (120 min cooldown)
+- Max 20 concurrent positions, max 1 per ticker, $1K max per position, 25% total exposure
+- Max 10 executions per day, 20% max per trade as % of equity
+- Profit targets: 50%/40%/30%/20% (adaptive by DTE >14/7-14/3-7/<3)
+- Stop loss: -40%, mandatory exit at DTE <= 5
+- Circuit breakers: 5% daily loss, 10% weekly loss, 5 consecutive losses (120 min cooldown), 50% single-trade emergency stop
 - **Calls only, ASK-side only** — no puts, no BID-side
 - DTE 6+, no upper limit (LEAPs allowed), premium $50-$500/contract, IV rank < 70% (true percentile vs 52-week realized vol)
 - Spread gate: blocks entries with bid-ask spread > 15% (bid/ask populated from Alpaca snapshots during IV enrichment)
+- Liquidity filters: min open interest 100, min volume 50
+- Min scoring threshold: 5 (was 7)
+- Ticker exclusions via scoring penalty (-100): TSLA, MSTR, SMH, SNDK, GOOG, NVDA
+- Floor trades scored at 0 weight (noise per autoresearch)
+- Premium scoring: tier1 ($250K) +2, tier2 ($500K) +4
+- Fill quality logged to data/fill_quality.jsonl for slippage validation
+- Daily summary logged to data/daily_summary.jsonl
+- Go/no-go checkpoints at 20, 40, 60 completed trades (Telegram alerts)
 
 ## Common Tasks
 

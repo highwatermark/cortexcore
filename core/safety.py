@@ -41,6 +41,7 @@ class SafetyGate:
             self._check_option_type,
             self._check_excluded_ticker,
             self._check_max_positions,
+            self._check_max_ticker_positions,
             self._check_max_exposure,
             self._check_max_position_value,
             self._check_max_executions_today,
@@ -99,6 +100,22 @@ class SafetyGate:
             return False, "Cannot verify positions — broker unreachable"
         if count >= max_pos:
             return False, f"Max positions reached: {count}/{max_pos}"
+        return True, ""
+
+    def _check_max_ticker_positions(self, signal: dict) -> tuple[bool, str]:
+        """Block entries when ticker already has max positions (broker is source of truth)."""
+        max_per_ticker = self._settings.trading.max_ticker_positions
+        ticker = signal.get("ticker", "").upper()
+        if not ticker:
+            return True, ""
+        from services.alpaca_broker import get_broker
+        try:
+            broker_positions = get_broker().get_positions()
+        except Exception:
+            return False, "Cannot verify positions — broker unreachable"
+        ticker_count = sum(1 for bp in broker_positions if bp.ticker.upper() == ticker)
+        if ticker_count >= max_per_ticker:
+            return False, f"Ticker {ticker} already has {ticker_count}/{max_per_ticker} position(s)"
         return True, ""
 
     def _check_max_exposure(self, signal: dict) -> tuple[bool, str]:

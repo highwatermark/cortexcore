@@ -225,6 +225,24 @@ def pre_trade_check(signal: dict, risk_assessment: dict) -> dict:
     if per_contract > risk_cfg.max_premium_per_contract * 100:  # premium in total dollars
         pass  # Premium check is at per-contract level, handled differently
 
+    # Per-ticker position limit (broker is source of truth)
+    ticker = signal.get("ticker", "").upper()
+    if ticker:
+        try:
+            broker_positions = get_broker().get_positions()
+            ticker_count = sum(1 for bp in broker_positions if bp.ticker.upper() == ticker)
+            if ticker_count >= trading.max_ticker_positions:
+                reasons.append(f"Ticker {ticker} already has {ticker_count}/{trading.max_ticker_positions} position(s)")
+                approved = False
+        except Exception:
+            pass  # Safety gate will catch this; fail-open here
+
+    # Volume check
+    vol = signal.get("volume", 0)
+    if vol < trading.min_volume:
+        reasons.append(f"Low volume: {vol} < {trading.min_volume}")
+        approved = False
+
     # Liquidity
     oi = signal.get("open_interest", 0)
     if oi < trading.min_open_interest:

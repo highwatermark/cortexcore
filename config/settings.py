@@ -33,25 +33,26 @@ class ApiKeys(BaseSettings):
 class TradingLimits(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TRADING_", extra="ignore")
 
-    max_positions: int = Field(3, ge=1, le=20)
+    max_positions: int = Field(20, ge=1, le=50)
     max_position_value: float = Field(1000.0, gt=0)
     max_per_trade_pct: float = Field(0.20, gt=0, le=1.0)
     max_total_exposure_pct: float = Field(0.25, gt=0, le=1.0)
     max_total_options_exposure: float = Field(8000.0, gt=0)
+    max_ticker_positions: int = Field(1, ge=1, le=10)
 
     # Profit / loss
-    profit_target_pct: float = Field(0.40, gt=0, le=5.0)
-    stop_loss_pct: float = Field(0.35, gt=0, le=1.0)
+    profit_target_pct: float = Field(0.50, gt=0, le=5.0)
+    stop_loss_pct: float = Field(0.40, gt=0, le=1.0)
     max_hold_dte: int = Field(5, ge=0)
 
     # Adaptive profit targets by DTE
-    adaptive_target_dte_gt_14: float = Field(0.40, gt=0, le=5.0)
-    adaptive_target_dte_7_to_14: float = Field(0.35, gt=0, le=5.0)
-    adaptive_target_dte_3_to_7: float = Field(0.25, gt=0, le=5.0)
-    adaptive_target_dte_lt_3: float = Field(0.15, gt=0, le=5.0)
+    adaptive_target_dte_gt_14: float = Field(0.50, gt=0, le=5.0)
+    adaptive_target_dte_7_to_14: float = Field(0.40, gt=0, le=5.0)
+    adaptive_target_dte_3_to_7: float = Field(0.30, gt=0, le=5.0)
+    adaptive_target_dte_lt_3: float = Field(0.20, gt=0, le=5.0)
 
     # Execution limits
-    max_executions_per_day: int = Field(2, ge=1)
+    max_executions_per_day: int = Field(10, ge=1)
 
     # Premium
     min_premium_per_contract: float = Field(50.0, gt=0)
@@ -63,7 +64,7 @@ class TradingLimits(BaseSettings):
 
     # Liquidity
     max_spread_pct: float = Field(15.0, gt=0, le=100.0)
-    min_volume: int = Field(10, ge=0)
+    min_volume: int = Field(50, ge=0)
     min_open_interest: int = Field(100, ge=0)
     min_bid_price: float = Field(0.05, ge=0)
 
@@ -91,7 +92,7 @@ class FlowScan(BaseSettings):
     scan_limit: int = Field(100, ge=1, le=200)
 
     # Post-filter
-    min_score: int = Field(7, ge=0, le=10)
+    min_score: int = Field(5, ge=0, le=10)
     max_analyze: int = Field(10, ge=1)
 
     # Quality checks
@@ -126,8 +127,8 @@ class RiskFramework(BaseSettings):
     max_premium_per_contract: float = Field(500.0, gt=0)
 
     # Exit triggers
-    profit_target_pct: float = Field(0.40, gt=0, le=5.0)
-    stop_loss_pct: float = Field(0.35, gt=0, le=1.0)
+    profit_target_pct: float = Field(0.50, gt=0, le=5.0)
+    stop_loss_pct: float = Field(0.40, gt=0, le=1.0)
     exit_on_thesis_invalidation: bool = True
     exit_on_gamma_risk: bool = True
     gamma_risk_dte_threshold: int = Field(5, ge=0)
@@ -185,10 +186,11 @@ class MonitorConfig(BaseSettings):
     max_exit_failures: int = Field(10, ge=1)
 
     # Trading circuit breakers
-    max_consecutive_losses: int = Field(2, ge=1)
+    max_consecutive_losses: int = Field(5, ge=1)
     max_daily_loss_pct: float = Field(0.05, gt=0, le=1.0)
     max_weekly_loss_pct: float = Field(0.10, gt=0, le=1.0)
     loss_cooldown_minutes: int = Field(120, ge=1)
+    max_single_trade_loss_pct: float = Field(0.50, gt=0, le=1.0)
 
     # Market timing safety
     market_open_delay_minutes: int = Field(0, ge=0)
@@ -217,6 +219,16 @@ class AgentModel(BaseSettings):
 # ---------------------------------------------------------------------------
 # Excluded tickers — single source of truth
 # ---------------------------------------------------------------------------
+
+# Ticker-specific scoring weights — autoresearch-identified losers get -100
+TICKER_WEIGHTS: dict[str, int] = {
+    "TSLA": -100,
+    "MSTR": -100,
+    "SMH": -100,
+    "SNDK": -100,
+    "GOOG": -100,
+    "NVDA": -100,
+}
 
 EXCLUDED_TICKERS: FrozenSet[str] = frozenset({
     # Index ETFs

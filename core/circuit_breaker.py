@@ -1,10 +1,11 @@
 """
 Trading circuit breakers — halt entries on excessive losses.
 
-Three independent breakers:
+Four independent breakers:
   1. Daily loss: realized losses today > max_daily_loss_pct of equity
   2. Weekly loss: realized losses this week > max_weekly_loss_pct of equity
   3. Consecutive losses: last N closed trades are all losers
+  4. Single trade loss: any open position down > max_single_trade_loss_pct (emergency exit)
 
 State is checked from DB on every call (survives restarts).
 """
@@ -153,6 +154,42 @@ class TradingCircuitBreaker:
             )
         finally:
             session.close()
+
+
+    def check_emergency_exits(self) -> list[dict]:
+        """Check if any open position exceeds the single-trade loss limit.
+
+        Returns list of position dicts that need immediate emergency exit.
+        Does NOT trip the trading breaker — just identifies positions to close.
+        """
+        max_loss = self._settings.monitor.max_single_trade_loss_pct
+        from services.alpaca_broker import get_broker
+
+        try:
+            broker_positions = get_broker().get_positions()
+        except Exception:
+            log.warning("emergency_exit_check_broker_unreachable")
+            return []
+
+        emergency_exits = []
+        for bp in broker_positions:
+            if bp.entry_price and bp.entry_price > 0:
+                loss_pct = (bp.entry_price - bp.current_price) / bp.entry_price
+                if loss_pct >= max_loss:
+                    emergency_exits.append({
+                        "option_symbol": bp.option_symbol,
+                        "ticker": bp.ticker,
+                        "loss_pct": round(loss_pct * 100, 1),
+                        "entry_price": bp.entry_price,
+                        "current_price": bp.current_price,
+                    })
+                    log.warning(
+                        "emergency_exit_triggered",
+                        ticker=bp.ticker,
+                        loss_pct=f"{loss_pct:.1%}",
+                        max_loss=f"{max_loss:.0%}",
+                    )
+        return emergency_exits
 
 
 _breaker: TradingCircuitBreaker | None = None

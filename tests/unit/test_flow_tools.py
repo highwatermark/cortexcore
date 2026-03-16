@@ -22,7 +22,8 @@ class TestScoreSignal:
         assert result["score"] >= 2  # sweep gives +2
         assert "sweep:+2" in result["breakdown"]
 
-    def test_floor_trade_bonus(self) -> None:
+    def test_floor_trade_no_bonus(self) -> None:
+        """Floor trades have zero weight per autoresearch (noise)."""
         signal = {
             "signal_id": "test-2",
             "ticker": "MSFT",
@@ -33,12 +34,12 @@ class TestScoreSignal:
             "dte": 30,
         }
         result = score_signal(signal)
-        assert "floor:+2" in result["breakdown"]
+        assert "floor" not in result["breakdown"]
 
     def test_high_vol_oi_bonus(self) -> None:
         signal = {
             "signal_id": "test-3",
-            "ticker": "NVDA",
+            "ticker": "AAPL",
             "order_type": "regular",
             "vol_oi_ratio": 3.5,
             "premium": 100000,
@@ -59,7 +60,7 @@ class TestScoreSignal:
             "dte": 30,
         }
         result = score_signal(signal)
-        assert "premium>=500K:+2" in result["breakdown"]
+        assert "premium>=500K:+4" in result["breakdown"]
 
     def test_iv_rank_penalty(self) -> None:
         signal = {
@@ -78,7 +79,7 @@ class TestScoreSignal:
     def test_low_dte_penalty(self) -> None:
         signal = {
             "signal_id": "test-6",
-            "ticker": "GOOG",
+            "ticker": "MSFT",
             "order_type": "regular",
             "vol_oi_ratio": 1.0,
             "premium": 100000,
@@ -265,7 +266,7 @@ class TestScoreSignal:
             "trade_count": 5,
         }
         result = score_signal(signal)
-        # sweep:+2, vol_oi>=1.5:+1, premium>=250K:+1, direction>=90%:+2, singleleg:+1, block:+1 = 8
+        # sweep:+2, vol_oi>=1.5:+1, premium>=250K:+2, direction>=90%:+2, singleleg:+1, block:+1 = 9
         assert result["passed"] is True
         assert result["score"] >= 7
 

@@ -102,23 +102,23 @@ class TestExitTriggers:
 
 class TestAdaptiveProfitTargets:
     def test_target_dte_gt_14(self) -> None:
-        assert _get_adaptive_profit_target(20) == 0.40
+        assert _get_adaptive_profit_target(20) == 0.50
 
     def test_target_dte_7_to_14(self) -> None:
-        assert _get_adaptive_profit_target(10) == 0.35
+        assert _get_adaptive_profit_target(10) == 0.40
 
     def test_target_dte_3_to_7(self) -> None:
-        assert _get_adaptive_profit_target(5) == 0.25
+        assert _get_adaptive_profit_target(5) == 0.30
 
     def test_target_dte_lt_3(self) -> None:
-        assert _get_adaptive_profit_target(2) == 0.15
+        assert _get_adaptive_profit_target(2) == 0.20
 
     def test_adaptive_trigger_fires_at_lower_target(self) -> None:
-        """DTE=5 position with +26% P&L should trigger (target=25%)."""
+        """DTE=5 position with +31% P&L should trigger (target=30%)."""
         position = {
             "position_id": "pos-adapt-1",
             "ticker": "AAPL",
-            "pnl_pct": 26.0,
+            "pnl_pct": 31.0,
             "dte_remaining": 5,
             "conviction": 80,
             "entry_price": 5.0,
@@ -129,11 +129,11 @@ class TestAdaptiveProfitTargets:
         assert any("PROFIT_TARGET" in t for t in result["triggers"])
 
     def test_adaptive_no_trigger_at_higher_dte(self) -> None:
-        """DTE=20 position with +38% P&L should NOT trigger (target=40%)."""
+        """DTE=20 position with +48% P&L should NOT trigger (target=50%)."""
         position = {
             "position_id": "pos-adapt-2",
             "ticker": "AAPL",
-            "pnl_pct": 38.0,
+            "pnl_pct": 48.0,
             "dte_remaining": 20,
             "conviction": 80,
             "entry_price": 5.0,

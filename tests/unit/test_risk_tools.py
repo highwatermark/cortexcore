@@ -8,13 +8,16 @@ from tools.risk_tools import pre_trade_check
 
 
 class TestPreTradeCheck:
-    def test_approved_healthy_portfolio(self) -> None:
+    @patch("tools.risk_tools.get_broker")
+    def test_approved_healthy_portfolio(self, mock_broker) -> None:
+        mock_broker.return_value.get_positions.return_value = []
         signal = {
             "signal_id": "sig-1",
             "ticker": "AAPL",
             "iv_rank": 30,
             "dte": 30,
             "open_interest": 1000,
+            "volume": 100,
             "score": 8,
             "conviction": 85,
         }
@@ -27,19 +30,22 @@ class TestPreTradeCheck:
         result = pre_trade_check(signal, risk)
         assert result["approved"] is True
 
-    def test_denied_max_positions(self) -> None:
+    @patch("tools.risk_tools.get_broker")
+    def test_denied_max_positions(self, mock_broker) -> None:
+        mock_broker.return_value.get_positions.return_value = []
         signal = {
             "signal_id": "sig-2",
             "ticker": "TSLA",
             "iv_rank": 30,
             "dte": 30,
             "open_interest": 1000,
+            "volume": 100,
             "score": 8,
         }
         risk = {
             "risk_score": 20,
             "risk_level": "HEALTHY",
-            "position_count": 3,
+            "position_count": 20,
             "risk_capacity_pct": 0.80,
         }
         result = pre_trade_check(signal, risk)

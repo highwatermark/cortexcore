@@ -74,9 +74,10 @@ class TestSafetyGate:
         assert allowed is False
 
     @patch("services.alpaca_broker.get_broker")
-    def test_max_positions_blocked(self, mock_get_broker) -> None:
-        # 3 positions at broker → at max (max_positions=3)
-        broker_positions = [_mock_broker_position(ticker=f"T{i}") for i in range(3)]
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_max_positions_blocked(self, mock_timing, mock_get_broker) -> None:
+        # 20 positions at broker → at max (max_positions=20)
+        broker_positions = [_mock_broker_position(ticker=f"T{i}") for i in range(20)]
         mock_get_broker.return_value = _mock_broker_account(positions=broker_positions)
 
         gate = SafetyGate()
@@ -106,9 +107,10 @@ class TestSafetyGate:
         assert "Trade value" in reason
 
     @patch("services.alpaca_broker.get_broker", return_value=_mock_broker_account())
-    def test_max_executions_today_blocked(self, mock_broker) -> None:
+    @patch.object(SafetyGate, "_check_market_timing", return_value=(True, ""))
+    def test_max_executions_today_blocked(self, mock_timing, mock_broker) -> None:
         session = get_session()
-        for i in range(2):
+        for i in range(10):
             session.add(OrderIntent(
                 idempotency_key=f"entry-sig-{i}", signal_id=f"sig-{i}",
                 ticker="AAPL", option_symbol="AAPL1", side=OrderSide.BUY,
@@ -291,9 +293,9 @@ class TestTradingCircuitBreaker:
 
     def test_consecutive_losses_trips(self) -> None:
         session = get_session()
-        for i in range(2):
+        for i in range(5):
             session.add(TradeLog(
-                position_id=f"pos-{i}", ticker="AAPL", action=SignalAction.CALL,
+                position_id=f"pos-consec-{i}", ticker="AAPL", action=SignalAction.CALL,
                 entry_price=5.0, exit_price=4.0, quantity=1,
                 pnl_dollars=-100, pnl_pct=-20, hold_duration_hours=8,
                 opened_at=datetime.now(timezone.utc) - timedelta(minutes=30),

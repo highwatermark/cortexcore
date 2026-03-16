@@ -176,6 +176,35 @@ class MonitorLoop:
                     log.error("reconciliation_failed", error=str(e))
 
             # =========================================================
+            # EMERGENCY SINGLE-POSITION LOSS CHECK
+            # =========================================================
+            try:
+                emergency_exits = breaker.check_emergency_exits()
+                for emg in emergency_exits:
+                    # Find the DB position_id for this option_symbol
+                    emg_positions = get_open_positions()
+                    for ep in emg_positions:
+                        if ep.get("option_symbol") == emg["option_symbol"]:
+                            log.warning("emergency_exit_executing",
+                                ticker=emg["ticker"],
+                                loss_pct=emg["loss_pct"],
+                                position_id=ep["position_id"])
+                            await execute_exit(
+                                position_id=ep["position_id"],
+                                reason=f"EMERGENCY_STOP: single trade loss {emg['loss_pct']:.1f}% >= {self.settings.monitor.max_single_trade_loss_pct:.0%}",
+                                use_market=True,
+                            )
+                            await self.notifier.send(
+                                f"<b>EMERGENCY STOP</b>\n"
+                                f"{emg['ticker']} {emg['option_symbol']}\n"
+                                f"Loss: {emg['loss_pct']:.1f}% (limit: {self.settings.monitor.max_single_trade_loss_pct:.0%})\n"
+                                f"Entry: ${emg['entry_price']:.2f} → Current: ${emg['current_price']:.2f}"
+                            )
+                            break
+            except Exception as e:
+                log.error("emergency_exit_check_failed", error=str(e))
+
+            # =========================================================
             # DETERMINISTIC PIPELINE — zero Claude API calls
             # =========================================================
             log.info("cycle_start", cycle=self._cycle_count)
@@ -431,11 +460,17 @@ class MonitorLoop:
         return 0 < minutes_past_close < 30 and now.weekday() < 5
 
     async def _send_daily_summary(self) -> None:
-        """Send enhanced end-of-day summary via Telegram."""
+        """Send enhanced end-of-day summary via Telegram and log to JSONL."""
         self._daily_summary_sent = True
         session = get_session()
         try:
-            from analytics.performance import get_performance_summary
+            from analytics.performance import (
+                check_go_no_go,
+                format_checkpoint_telegram,
+                get_avg_slippage,
+                get_performance_summary,
+                log_daily_summary,
+            )
             from core.utils import trading_today
 
             today = trading_today()
@@ -452,6 +487,7 @@ class MonitorLoop:
                 .all()
             )
             total_pnl = sum(t.pnl_dollars for t in trades)
+            tickers_traded = list({t.ticker for t in trades if t.ticker})
 
             try:
                 open_count = len(self._broker.get_positions())
@@ -459,6 +495,7 @@ class MonitorLoop:
                 open_count = 0
 
             perf = get_performance_summary(30)
+            slippage = get_avg_slippage()
 
             try:
                 account = self._broker.get_account()
@@ -470,16 +507,25 @@ class MonitorLoop:
             breaker = get_trading_breaker()
             breaker_state = breaker.check(equity) if equity else None
 
+            cb_fired = []
+            if breaker_state and breaker_state.is_tripped:
+                cb_fired.append(breaker_state.reason)
+
             msg_parts = [
                 f"<b>Daily Summary — {today}</b>",
                 f"",
                 f"<b>Today:</b>",
-                f"  Trades: {trades_today}",
+                f"  Trades exited: {trades_today}",
                 f"  P&L: ${total_pnl:+,.2f}",
                 f"  Open positions: {open_count}",
                 f"",
                 f"<b>Account:</b>",
                 f"  Equity: ${equity:,.0f}",
+                f"",
+                f"<b>Slippage:</b>",
+                f"  Avg: {slippage['avg_slippage_pct']:.2%}",
+                f"  Worst: {slippage['worst_slippage_pct']:.2%}",
+                f"  Fills logged: {slippage['count']}",
                 f"",
                 f"<b>30-Day Performance:</b>",
                 f"  Win rate: {perf['win_rate']:.0%}",
@@ -497,6 +543,34 @@ class MonitorLoop:
             msg_parts.append(f"\nCycles today: {self._cycle_count}")
 
             await self.notifier.send("\n".join(msg_parts))
+
+            # Log to JSONL
+            try:
+                log_daily_summary(
+                    trades_entered=0,  # Will be refined with cycle tracking
+                    trades_exited=trades_today,
+                    open_positions=open_count,
+                    account_value=equity,
+                    signals_received=0,
+                    signals_passed_score=0,
+                    signals_passed_filters=0,
+                    signals_executed=0,
+                    circuit_breakers_fired=cb_fired,
+                    tickers_traded=tickers_traded,
+                )
+            except Exception as e:
+                log.warning("daily_jsonl_log_failed", error=str(e))
+
+            # Check go/no-go checkpoint
+            try:
+                checkpoint = check_go_no_go()
+                if checkpoint:
+                    checkpoint_msg = format_checkpoint_telegram(checkpoint)
+                    await self.notifier.send(checkpoint_msg)
+                    log.info("go_no_go_sent", checkpoint=checkpoint.get("checkpoint"))
+            except Exception as e:
+                log.warning("go_no_go_check_failed", error=str(e))
+
             log.info("daily_summary_sent", pnl=total_pnl, trades=trades_today, positions=open_count)
         except Exception as e:
             log.error("daily_summary_error", error=str(e))
