@@ -303,11 +303,15 @@ class Orchestrator:
         """
         signals_text = []
         for sig, score, ptc in passing_signals:
+            option_price = sig.get('option_price', 0)
+            cost_per_contract = option_price * 100 if option_price else 0
+            cost_str = f"${cost_per_contract:,.0f}" if cost_per_contract else "unknown"
             signals_text.append(
                 f"  {sig['ticker']} {sig.get('option_type', '?')} ${sig.get('strike', 0):.0f} "
                 f"exp {sig.get('expiration', '?')} DTE={sig.get('dte', 0)}\n"
                 f"    Premium: ${sig.get('premium', 0):,.0f} | Vol/OI: {sig.get('vol_oi_ratio', 0)} | "
                 f"Order type: {sig.get('order_type', '?')}\n"
+                f"    Per-contract cost: {cost_str} | Option price: ${option_price:.2f}\n"
                 f"    Score: {score['score']}/10 — {score['breakdown']}\n"
                 f"    Direction: {sig.get('directional_pct', 0):.0%} {sig.get('directional_side', '')} side\n"
                 f"    Underlying: ${sig.get('underlying_price', 0):,.2f}\n"

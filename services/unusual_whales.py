@@ -328,6 +328,16 @@ class UnusualWhalesClient:
                 log.debug("filter_drop", ticker=ticker, reason="strike_distance", distance=f"{distance:.2%}")
                 return None, "strike_distance"
 
+        # Per-contract affordability — drop signals we can't possibly buy
+        per_contract_price = float(item.get("price", 0) or 0)
+        if per_contract_price > 0:
+            cost_per_contract = per_contract_price * 100  # options multiplier
+            max_position_value = get_settings().trading.max_position_value
+            if cost_per_contract > max_position_value:
+                log.debug("filter_drop", ticker=ticker, reason="too_expensive",
+                          cost_per_contract=cost_per_contract, max_position_value=max_position_value)
+                return None, "too_expensive"
+
         # Order type from boolean flags (flow-alerts format)
         order_parts: list[str] = []
         if item.get("has_sweep", False):
@@ -375,5 +385,6 @@ class UnusualWhalesClient:
             has_singleleg=has_singleleg,
             has_multileg=has_multileg,
             trade_count=trade_count,
+            option_price=per_contract_price,
             next_earnings_date="",  # Fetched separately via get_next_earnings_date
         ), ""

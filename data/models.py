@@ -240,6 +240,9 @@ class FlowSignal(BaseModel):
     trade_count: int = 0
     next_earnings_date: str = ""
 
+    # Per-contract option price (from UW "price" field)
+    option_price: float = 0.0
+
     # Bid/ask from Alpaca snapshot (for spread gate)
     bid: float = 0.0
     ask: float = 0.0

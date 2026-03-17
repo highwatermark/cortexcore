@@ -56,7 +56,7 @@ class TradingLimits(BaseSettings):
 
     # Premium
     min_premium_per_contract: float = Field(50.0, gt=0)
-    max_premium_per_contract: float = Field(500.0, gt=0)
+    max_premium_per_contract: float = Field(1000.0, gt=0)
 
     # DTE
     min_dte: int = Field(6, ge=0)
@@ -124,7 +124,7 @@ class RiskFramework(BaseSettings):
     max_iv_rank_for_entry: int = Field(70, ge=0, le=100)
     require_trend_alignment: bool = True
     min_dte_for_entry: int = Field(6, ge=0)
-    max_premium_per_contract: float = Field(500.0, gt=0)
+    max_premium_per_contract: float = Field(1000.0, gt=0)
 
     # Exit triggers
     profit_target_pct: float = Field(0.50, gt=0, le=5.0)
