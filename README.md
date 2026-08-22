@@ -1,4 +1,22 @@
-# Momentum Agent v2
+# cortexcore — Momentum Agent v2
+
+> **What this is.** The options-flow trading agent I run, and the infrastructure it
+> stands on: orchestration through the Claude Agent SDK, a deterministic 14-check
+> safety gate, kill switch and circuit breakers, broker-as-source-of-truth
+> reconciliation, and VIX-based market-regime context. The model plans and scores;
+> deterministic code decides whether a trade is allowed to happen, and nothing in
+> the prompt can override it.
+>
+> **Status.** Research code that runs for real (paper or live, per `.env`). Not a
+> framework, not a package, not advice — interfaces change when I need them to.
+>
+> **Related.** [reward_hacking_research](https://github.com/highwatermark/reward_hacking_research) — a documented reward hack in a
+> self-optimizing trading-research agent (a second exploit found 18 minutes after
+> the first was patched), with the full trajectory and re-runnable ablations.
+> The safety-gate design here is the same instinct applied to execution instead
+> of evaluation: trust the model's reasoning, never its authority.
+
+---
 
 AI-native options flow trading system powered by the Anthropic Claude Agent SDK. Monitors institutional options flow via the Unusual Whales API, scores signals using deterministic rules, and executes trades through Alpaca with a multi-layered safety architecture. Trades **calls only, ASK-side only** — following institutional buyers with no directional interpretation needed.
 
